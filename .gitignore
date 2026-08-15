@@ -1,0 +1,21 @@
+# session data: never commit participant data
+data/
+eval_out/
+*.csv
+*_meta.txt
+
+# MediaPipe model (large, download separately)
+pose_landmarker.task
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
