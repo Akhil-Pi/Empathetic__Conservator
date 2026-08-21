@@ -32,6 +32,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple
 import numpy as np
+import logging
+logger = logging.getLogger(__name__)
 
 from camera_config import (SAGITTAL_ANGLES, FRONTAL_ANGLES, TRANSVERSE_ANGLES,
                            CameraConfig)
@@ -302,6 +304,19 @@ def _pick_sagittal(side_world, front_world, vec_fn, needed, cfg) -> Tuple[float,
     return 0.0, 0.0
 
 
+# Map from MediaPipe landmark index to the name keys used by the fusion geometry.
+_IDX_TO_NAME = {v: k for k, v in LM.items()}
+
+
+def _landmarks_to_dict(world_landmarks) -> dict:
+    """Convert MediaPipe pose_world_landmarks into the dict format the fusion
+    geometry expects: {name: np.array([x, y, z, visibility])}."""
+    out = {}
+    for idx, name in _IDX_TO_NAME.items():
+        lm = world_landmarks[idx]
+        out[name] = np.array([lm.x, lm.y, lm.z, lm.visibility])
+    return out
+
 # --------------------------------------------------------------------------
 # MediaPipe wrapper. One instance per camera. Guarded so this file imports and
 # self-tests without a camera. Extracts BOTH normalized and world landmarks.
@@ -327,22 +342,30 @@ class PoseDetectorV2:
             output_segmentation_masks=False,
         )
         self.landmarker = vision.PoseLandmarker.create_from_options(opts)
+        self._last_ts = -1
 
-    def detect(self, frame_bgr, timestamp_ms: int) -> Optional[dict]:
-        """Return a world-landmark dict (name -> [x, y, z, visibility]) or None."""
+    def detect(self, frame, timestamp_ms: int):
+        """Detect pose landmarks. Ensures timestamps are strictly increasing
+        per detector instance, which MediaPipe requires for detect_for_video."""
         import cv2
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
-        result = self.landmarker.detect_for_video(image, timestamp_ms)
+        import mediapipe as mp
+        if frame is None:
+            return None
+        # MediaPipe rejects non-increasing timestamps. On Windows, time.time()
+        # resolution can produce duplicates at high frame rates.
+        if timestamp_ms <= self._last_ts:
+            timestamp_ms = self._last_ts + 1
+        self._last_ts = timestamp_ms
+        image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                         data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        try:
+            result = self.landmarker.detect_for_video(image, timestamp_ms)
+        except Exception as e:
+            logger.debug(f"pose detection failed: {e}")
+            return None
         if not result.pose_world_landmarks:
             return None
-        wl = result.pose_world_landmarks[0]
-        out = {}
-        for name, idx in LM.items():
-            p = wl[idx]
-            vis = getattr(p, "visibility", 1.0)
-            out[name] = np.array([p.x, p.y, p.z, vis], float)
-        return out
+        return _landmarks_to_dict(result.pose_world_landmarks[0])
 
     def close(self):
         self.landmarker.close()

@@ -95,7 +95,7 @@ class RobotConfig:
 
     # Baseline artifact pose, identical in BOTH conditions (the confound fix).
     # [x, y, z, rx, ry, rz]; rotation is an axis-angle vector.
-    BASELINE_POSE = [0.0, -0.30, 0.15, 0.0, 3.14159, 0.0]
+    BASELINE_POSE = [252.60, 130.75, 72.53, 0.018, -4.067, 0.043]
 
     # ---- singularity avoidance ----
     # Sessions kept ending in a singularity. A Cartesian box does not prevent
