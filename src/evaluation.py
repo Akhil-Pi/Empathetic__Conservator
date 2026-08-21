@@ -553,7 +553,7 @@ def fit_response_gains(sessions: list[Session], pre_s: float = 2.0,
             e = ev.iloc[i]
             t0 = float(e["timestamp_s"])
             # contamination guard: neighbouring interventions inside the windows
-            if i > 0 and (t0 - times[i - 1]) < (pre_s + post_start_s):
+            if i > 0 and (t0 - times[i - 1]) < (pre_s + post_start_s + post_s):
                 continue
             if i < len(times) - 1 and (times[i + 1] - t0) < (post_start_s + post_s):
                 continue
