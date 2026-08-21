@@ -493,7 +493,8 @@ class UR3Robot(_RobotBase):
             jm["shoulder_m"] = min(jm["shoulder_m"], cart["shoulder_m"])
             jm["worst_norm"] = min(
                 jm["worst_norm"],
-                cart["radius_m"] / self.th.RADIUS_WARN_M)
+                cart["radius_m"] / self.th.RADIUS_WARN_M,
+                jm["shoulder_m"] / self.th.SHOULDER_WARN_M)
             jm["ik_ok"] = True
             return jm
         except Exception as e:

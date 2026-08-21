@@ -226,6 +226,24 @@ def test_latency_uses_wall_clock():
 
 
 @test
+def test_drot_direction_uses_trunk_twist():
+    """REGRESSION: drot direction ignored trunk_twist_deg entirely and fell
+    back to a fixed sign whenever neck_twist_deg and neck_sidebend_deg were
+    both zero, even though trunk_twist_deg is a valid GAINS/DOF_REQUIRES
+    driver of drot."""
+    from pss_v2 import PSSv2Calculator, PostureAngles
+    from goal_controller import GoalBasedController, _FakeRobot
+    ctrl = GoalBasedController("experimental", PSSv2Calculator())
+    robot = _FakeRobot()
+    ang = PostureAngles(trunk_twist_deg=-25)  # neck_twist_deg, neck_sidebend_deg default to 0
+    ctrl._execute({"drot": 0.2}, ang, robot)
+    kind, applied = robot.moves[-1]
+    assert kind == "adjust_rotation"
+    assert applied > 0, \
+        "drot sign must follow trunk_twist_deg, not fall back to a fixed default"
+
+
+@test
 def test_predicted_pss_is_pss_not_cost():
     """REGRESSION: predicted_pss_before/after used to carry optimizer COST,
     which includes effort and overcorrection penalties, under a PSS label."""
@@ -532,6 +550,26 @@ def test_front_sagittal_fallback_is_off_by_default():
 
 
 @test
+def test_frontal_angle_confidence_is_populated_and_scaled():
+    """REGRESSION: fuse() never wrote a confidence entry for trunk_sidebend_deg
+    / neck_sidebend_deg / lateral_gaze_deg, so apply_layout_mask's confidence
+    scaling silently no-opped for them on every layout, including degraded
+    ones like SIDE_FRONT_OBLIQUE that are supposed to show up in the logs."""
+    from pose_fusion import fuse, apply_layout_mask, _make_pose
+    from camera_config import LAYOUTS
+    pa = fuse(None, _make_pose(sidebend_deg=20))
+    for name in ("trunk_sidebend_deg", "neck_sidebend_deg", "lateral_gaze_deg"):
+        assert pa.confidence.get(name) == 1.0, \
+            f"fuse() must record a confidence for {name}, got {pa.confidence.get(name)}"
+
+    masked = apply_layout_mask(pa, LAYOUTS["SIDE_FRONT_OBLIQUE"])
+    for name in ("trunk_sidebend_deg", "neck_sidebend_deg", "lateral_gaze_deg"):
+        assert abs(masked.confidence[name] - 0.8) < 1e-9, \
+            (f"SIDE_FRONT_OBLIQUE must scale {name} confidence to 0.8, "
+             f"got {masked.confidence[name]}")
+
+
+@test
 def test_single_camera_capture_allowed():
     import camera_stream as cs
     assert "side_source=None" in cs.DualCamera.__init__.__doc__ or True
@@ -696,6 +734,68 @@ def test_gain_fitter_refuses_unidentifiable_data():
     res = fit_response_gains(load_sessions(tmp), min_events=5)
     fit = res["per_angle"]["trunk_flexion_deg"]
     assert fit["fitted"] is None, "fitter invented gains from unidentifiable data"
+
+
+@test
+def test_gain_fitter_excludes_events_contaminated_by_prior_post_window():
+    """REGRESSION: the backward contamination guard checked the gap against
+    pre_s + post_start_s only, omitting post_s. An event whose 'pre' baseline
+    window still overlapped the PREVIOUS event's post window could pass the
+    guard and corrupt the fitted gain."""
+    import csv
+    import numpy as _np
+    from session_logger_v2 import FRAME_COLUMNS, EVENT_COLUMNS
+    from evaluation import load_sessions, fit_response_gains
+
+    tmp = tempfile.mkdtemp()
+    rng = _np.random.RandomState(2)
+    base = os.path.join(tmp, "P1_experimental_20260805_000003")
+    frames, events = [], []
+
+    def add_event(t0, dz, dy, red):
+        for tt in _np.arange(t0 - 3.0, t0 - 0.1, 0.1):
+            frames.append({c: 0 for c in FRAME_COLUMNS} | {
+                "timestamp_s": f"{tt:.3f}", "trunk_flexion_deg": "40.00",
+                "pss_smooth": "0.4", "pss_raw": "0.4"})
+        for tt in _np.arange(t0 + 0.5, t0 + 3.0, 0.1):
+            frames.append({c: 0 for c in FRAME_COLUMNS} | {
+                "timestamp_s": f"{tt:.3f}",
+                "trunk_flexion_deg": f"{40.0 - red:.2f}",
+                "pss_smooth": "0.1", "pss_raw": "0.1"})
+        events.append({c: "" for c in EVENT_COLUMNS} | {
+            "timestamp_s": f"{t0:.3f}", "event_type": "intervention",
+            "dz": f"{dz:.4f}", "dy": f"{dy:.4f}", "dtilt": "0.0",
+            "drot": "0.0", "dx": "0.0", "latency_s": "0.9"})
+
+    # 10 well-separated, clean events so min_events is comfortably satisfied
+    # regardless of what happens to the contaminated pair below.
+    t = 0.0
+    for _ in range(10):
+        t0 = t + 3.0
+        dz, dy = rng.uniform(0, 0.08), rng.uniform(0, 0.06)
+        add_event(t0, dz, dy, 150.0 * dz + 100.0 * dy)
+        t = t0 + 9.0
+
+    # A: far from the last clean event, but only 2.6s before B. A is already
+    # excluded by the (correct, unchanged) forward-gap check, since 2.6s <
+    # post_start_s + post_s = 3.0s. B is the last event, so only the backward
+    # check applies to it: 2.6s < pre_s + post_start_s (2.5s) is false, so the
+    # unfixed guard let B through even though A's post-window [tA+0.5, tA+3.0]
+    # overlaps B's pre-window [tB-2.0, tB-0.1].
+    tA = t + 3.0
+    add_event(tA, 0.04, 0.02, 5.0)
+    tB = tA + 2.6
+    add_event(tB, 0.05, 0.03, 5.0)
+
+    with open(base + "_frames.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FRAME_COLUMNS); w.writeheader(); w.writerows(frames)
+    with open(base + "_events.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=EVENT_COLUMNS); w.writeheader(); w.writerows(events)
+
+    res = fit_response_gains(load_sessions(tmp), min_events=5)
+    assert res["n_events_used"] == 10, \
+        (f"expected B to be excluded as contaminated by A's post-window, "
+         f"got n_events_used={res['n_events_used']}")
 
 
 @test

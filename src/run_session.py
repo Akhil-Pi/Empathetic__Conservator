@@ -142,6 +142,7 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
         while time.time() - t0 < calib_s:
             (sf, _), (ff, _) = dual.read_pair()
             if not _have_required(sf, ff, det_side, det_front):
+                time.sleep(0.005)
                 continue
             ms = int(time.time() * 1000) - base_ms
             samples.append(fuse(_det(det_side, sf, ms), _det(det_front, ff, ms)))
@@ -161,6 +162,7 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
         while time.time() - t0 < minutes * 60:
             (sf, s_ts), (ff, f_ts) = dual.read_pair()
             if not _have_required(sf, ff, det_side, det_front):
+                time.sleep(0.005)
                 continue
             ms = int(time.time() * 1000) - base_ms
             angles = fuse(_det(det_side, sf, ms), _det(det_front, ff, ms))
