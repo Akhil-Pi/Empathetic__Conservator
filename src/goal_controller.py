@@ -82,6 +82,40 @@ class ControllerConfig:
     OVERCORRECT_PENALTY = 0.03  # per deg any flexion is driven past neutral
                                # (stops the arm from over-raising into extension)
 
+    # Rotation is preferred over translation whenever either could relieve the
+    # same strain: dz/dtilt both reduce neck_flexion_deg, dx/drot both reduce
+    # neck_sidebend_deg (see GAINS). Weighting translation's effort higher
+    # makes the optimiser reach for rotation first and only spend translation
+    # on angles rotation genuinely cannot touch (trunk_flexion, trunk_sidebend).
+    # Tuning: 1.0 = no preference (translation and rotation compete equally).
+    # Raise the translation weights to push more of the shared correction onto
+    # rotation; lower them toward 1.0 if rotation is being asked to do more
+    # than its STEP_LIMIT/GAINS can actually deliver and translation should
+    # pick up the slack sooner. At 2.5, drot fires at its full step on the
+    # first trigger while dx only takes the residual rotation can't share.
+    EFFORT_WEIGHT = {
+        "dz": 2.5, "dy": 2.5, "dx": 2.5,     # translation
+        "dtilt": 1.0, "drot": 1.0,           # rotation
+    }
+
+    # A retrigger that fires before the person's posture has actually improved
+    # (they haven't had time to react, or GAINS overestimates the real effect)
+    # would otherwise recompute and reapply the SAME full-size correction every
+    # cycle, walking the artifact straight into the workspace/orientation
+    # limits. Each unresolved retrigger within one episode (from the first
+    # threshold-crossing to hysteresis-confirmed recovery) shrinks the step by
+    # this factor, so repeated small moves taper off instead of piling up
+    # without bound.
+    # Tuning: 1.0 disables decay (every retrigger fires at full STEP_LIMIT
+    # again -- the old walk-into-the-wall behaviour). Smaller values converge
+    # faster (fewer retriggers before the step is negligible) but correct less
+    # total strain per episode before giving up; 0.6 reaches ~0 by the 7th-8th
+    # retrigger, which at SUSTAINED_S=COOLDOWN_S=2.0 is about 30 s into a
+    # sustained episode. If real sessions show it giving up before the person
+    # actually recovers, raise it toward 0.8; if it's still reaching the
+    # envelope/orientation limits, lower it.
+    EPISODE_DECAY = 0.6
+
     # Direction the artifact moves to counter an observed lean/twist. The
     # optimiser picks the lateral/rotation MAGNITUDE; this sign sets the
     # physical direction. +1 means "shift/rotate opposite the observed sign"
@@ -191,6 +225,7 @@ def ergonomic_cost(current: PostureAngles, delta: Dict[str, float],
     # Score the predicted posture directly (raw, uncalibrated single read).
     pss_pred = _score_once(predicted, pss_calc)
     effort = cfg.LAMBDA_EFFORT * sum(
+        getattr(cfg, "EFFORT_WEIGHT", {}).get(d, 1.0) *
         (delta.get(d, 0.0) / cfg.STEP_LIMIT[d]) ** 2 for d in cfg.DOF)
     over = cfg.OVERCORRECT_PENALTY * _overcorrection(current, predicted)
     sing = cfg.LAMBDA_SINGULARITY * extra_cost(delta) if extra_cost else 0.0
@@ -215,6 +250,17 @@ def _score_once(angles: PostureAngles, pss_calc: PSSv2Calculator) -> float:
 # Optimiser: bounded coordinate descent. Deterministic, robust to the kinks in
 # PSS_v2, numpy-only. Low DOF and a cheap cost make this fast enough per event.
 # --------------------------------------------------------------------------
+
+def _scaled_step_cfg(cfg, scale: float):
+    """A cfg-like object whose STEP_LIMIT is scaled, everything else inherited.
+    Used to taper repeated retriggers within one uncorrected episode (see
+    ControllerConfig.EPISODE_DECAY) without touching the caller's cfg."""
+    if scale >= 1.0:
+        return cfg
+    class _Scaled(cfg):
+        STEP_LIMIT = {d: v * scale for d, v in cfg.STEP_LIMIT.items()}
+    return _Scaled
+
 
 def optimize_target(current: PostureAngles, pss_calc: PSSv2Calculator,
                     cfg=ControllerConfig, dof=None,
@@ -269,12 +315,14 @@ class GoalBasedController:
         self._in_corrected = False
         self._last_intervention_at = float("-inf")
         self._count = 0
+        self._episode_fires = 0
 
     def reset(self):
         self._above_since = None
         self._in_corrected = False
         self._last_intervention_at = float("-inf")
         self._count = 0
+        self._episode_fires = 0
 
     def evaluate(self, pss_components: dict, angles: PostureAngles, robot,
                  now: Optional[float] = None) -> dict:
@@ -290,6 +338,7 @@ class GoalBasedController:
         if self._in_corrected and pss < (self.cfg.THRESHOLD - self.cfg.HYSTERESIS):
             self._in_corrected = False
             self._above_since = None
+            self._episode_fires = 0
 
         # Cooldown.
         if (now - self._last_intervention_at) < self.cfg.COOLDOWN_S:
@@ -318,8 +367,10 @@ class GoalBasedController:
         # Ask the robot to score candidate moves for singularity proximity, so
         # the optimiser avoids singular regions rather than being refused later.
         extra_cost = getattr(robot, "singularity_cost", None)
+        step_cfg = _scaled_step_cfg(self.cfg, self.cfg.EPISODE_DECAY ** self._episode_fires)
+        self._episode_fires += 1
         delta, cost_before, cost_after = optimize_target(
-            angles, self.pss_calc, self.cfg, dof=self.dof, extra_cost=extra_cost)
+            angles, self.pss_calc, step_cfg, dof=self.dof, extra_cost=extra_cost)
 
         # Pure predicted PSS for logging. The optimizer costs above include the
         # effort and overcorrection penalties, so they must not be reported as
