@@ -114,7 +114,23 @@ class ControllerConfig:
     # sustained episode. If real sessions show it giving up before the person
     # actually recovers, raise it toward 0.8; if it's still reaching the
     # envelope/orientation limits, lower it.
+    #
+    # The counter resets whenever pss drops back below THRESHOLD (a fresh
+    # problem, not a continuation of the old one -- see evaluate()), so this
+    # only compounds within ONE unresolved episode. Do not remove that reset:
+    # without it the counter never comes back down across a whole session and
+    # every move eventually shrinks to nothing, which is a real bug we hit
+    # (steps became imperceptible and rotation looked like it had vanished
+    # again, even though drot itself was working -- everything was decayed to
+    # the same near-zero scale). EPISODE_DECAY_FLOOR below is a second,
+    # independent safety net against the same failure mode.
     EPISODE_DECAY = 0.6
+
+    # Belt-and-suspenders for the compounding-decay failure above: even if the
+    # per-episode reset above is ever wrong (a new camera/PSS edge case, a
+    # config change elsewhere), the step scale can never fall below this
+    # fraction of STEP_LIMIT, so a move is always at least visibly happening.
+    EPISODE_DECAY_FLOOR = 0.2
 
     # Direction the artifact moves to counter an observed lean/twist. The
     # optimiser picks the lateral/rotation MAGNITUDE; this sign sets the
@@ -345,9 +361,13 @@ class GoalBasedController:
             result["reason"] = "cooldown"
             return result
 
-        # Below threshold: nothing to do.
+        # Below threshold: nothing to do. This also ends the current escalation
+        # episode (see EPISODE_DECAY) -- the strain that started it is gone, so
+        # a future trigger is a fresh problem, not a continuation, and should
+        # get a full-size step again rather than an ever-shrinking leftover.
         if pss < self.cfg.THRESHOLD:
             self._above_since = None
+            self._episode_fires = 0
             result["reason"] = "below_threshold"
             return result
 
@@ -367,7 +387,9 @@ class GoalBasedController:
         # Ask the robot to score candidate moves for singularity proximity, so
         # the optimiser avoids singular regions rather than being refused later.
         extra_cost = getattr(robot, "singularity_cost", None)
-        step_cfg = _scaled_step_cfg(self.cfg, self.cfg.EPISODE_DECAY ** self._episode_fires)
+        decay_scale = max(self.cfg.EPISODE_DECAY ** self._episode_fires,
+                          self.cfg.EPISODE_DECAY_FLOOR)
+        step_cfg = _scaled_step_cfg(self.cfg, decay_scale)
         self._episode_fires += 1
         delta, cost_before, cost_after = optimize_target(
             angles, self.pss_calc, step_cfg, dof=self.dof, extra_cost=extra_cost)
