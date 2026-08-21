@@ -53,11 +53,11 @@ class ControllerConfig:
     # intervention so no move is ever a large jump.
     DOF = ["dz", "dy", "dtilt", "drot", "dx"]
     STEP_LIMIT = {
-        "dz":    0.08,   # raise / lower, m
-        "dy":    0.06,   # toward / away from worker, m
-        "dtilt": 0.30,   # end-effector tilt, rad
-        "drot":  0.40,   # rotation about vertical, rad
-        "dx":    0.06,   # lateral, m
+        "dz":    0.03,   # raise / lower, m
+        "dy":    0.02,   # toward / away from worker, m
+        "dtilt": 0.10,   # end-effector tilt, rad
+        "drot":  0.08,   # rotation about vertical, rad
+        "dx":    0.02,   # lateral, m
     }
 
     # Linear human-response model: how much each DOF reduces each scored angle.
@@ -97,8 +97,8 @@ class ControllerConfig:
     # Trigger logic (kept from the reactive policy; these parts were sound).
     THRESHOLD = 0.25
     HYSTERESIS = 0.08
-    SUSTAINED_S = 0.75
-    COOLDOWN_S = 1.5
+    SUSTAINED_S = 2.0
+    COOLDOWN_S = 2.0
 
     # Optimiser resolution.
     LINE_SEARCH_POINTS = 21

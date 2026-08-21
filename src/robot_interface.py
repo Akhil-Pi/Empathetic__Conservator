@@ -75,15 +75,15 @@ class RobotConfig:
     # Conservative motion near a person. Slower is safer, but note that motion
     # time lands inside the measured intervention latency, which is an input to
     # the latency-vs-recovery analysis. Keep this FIXED across all sessions.
-    SPEED_MS = 0.10               # m/s, TCP linear
-    ACCEL_MS2 = 0.30              # m/s^2
+    SPEED_MS = 0.03               # m/s, TCP linear
+    ACCEL_MS2 = 0.10              # m/s^2
     BLEND_R = 0.0
 
     # Absolute workspace envelope in the ROBOT BASE frame (metres). This bounds
     # the accumulation of interventions. Measure these on the rig and tighten
     # them; the defaults are placeholders that MUST be set before live running.
-    ENVELOPE_MIN = (-0.20, -0.40, 0.05)   # (x, y, z)
-    ENVELOPE_MAX = (0.20, -0.15, 0.30)
+    ENVELOPE_MIN = (-0.33, -0.22, 0.38)
+    ENVELOPE_MAX = (-0.18, -0.08, 0.56)    # (x, y, z)
     ENVELOPE_VERIFIED = True     # flip to True once measured on the rig
 
     # Absolute orientation bound, radians from the baseline orientation.
@@ -109,7 +109,7 @@ class RobotConfig:
     # the artifact is worked. NOT derived from DH; sampling the nominal chain
     # gives TCP distances well past the published 500 mm figure because the
     # wrist offsets stack, so this is a measurement, like the envelope.
-    WORKING_RADIUS_M = 0.42
+    WORKING_RADIUS_M = 0.50
 
     # Use the robot's own IK for exact joint-space margins when live. UR
     # publishes DH parameters that are revision-controlled per serial number,
