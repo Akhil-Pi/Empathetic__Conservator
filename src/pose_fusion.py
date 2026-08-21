@@ -145,6 +145,29 @@ def frontal_deviation(vec: np.ndarray, cfg=FusionConfig) -> float:
     return float(np.degrees(np.arctan2(lat, up))) if up != 0 or lat != 0 else 0.0
 
 
+def transverse_twist(upper_vec: np.ndarray, lower_vec: np.ndarray, cfg=FusionConfig) -> float:
+    """
+    Signed twist angle (deg) of `upper_vec` relative to `lower_vec`, measured
+    in the transverse (horizontal) plane spanned by the lateral and
+    forward-back axes. This is the "projected shoulder line against the hip
+    line" measurement documented as the twist method in camera_config.py:
+    trunk twist = shoulder line vs hip line, neck twist = ear line vs
+    shoulder line. Zero means the two lines point the same way when viewed
+    from above (no rotation about the vertical axis); it does NOT need the
+    side camera, since twist about the vertical axis is invisible from the
+    side and only shows up in the front view's horizontal-plane projection.
+    """
+    def _horiz(v: np.ndarray) -> np.ndarray:
+        return np.array([v[cfg.WORLD_LAT_AXIS], v[cfg.WORLD_FWD_AXIS]])
+    u, l = _horiz(upper_vec), _horiz(lower_vec)
+    nu, nl = np.linalg.norm(u), np.linalg.norm(l)
+    if nu < 1e-9 or nl < 1e-9:
+        return 0.0
+    cross = l[0] * u[1] - l[1] * u[0]
+    dot = float(np.dot(l, u))
+    return float(np.degrees(np.arctan2(cross, dot)))
+
+
 def angle_at(joint: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
     """Interior angle at `joint` formed by segments joint->a and joint->b."""
     u, v = a - joint, b - joint
@@ -213,16 +236,31 @@ def fuse(side_world: Optional[dict], front_world: Optional[dict],
     # ---- lateral / twist (prefer front) ----
     trunk_side = 0.0
     neck_side = 0.0
+    trunk_twist = 0.0
+    neck_twist = 0.0
     gaze_deg = 0.0
     trunk_side_needed = ["LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"]
     neck_side_needed = ["LEFT_EAR", "RIGHT_EAR", "LEFT_SHOULDER", "RIGHT_SHOULDER"]
     if _joint_ok(front_world, trunk_side_needed, cfg):
         trunk_side = frontal_deviation(_trunk_vec(front_world), cfg)
         conf["trunk_sidebend_deg"] = min(_vis(front_world, n) for n in trunk_side_needed)
+        # twist: shoulder line rotated against the hip line in the horizontal
+        # plane. Invisible from the side camera by construction, so this is
+        # front-view only with no side fallback (unlike flexion above).
+        shoulder_line = _xyz(front_world, "RIGHT_SHOULDER") - _xyz(front_world, "LEFT_SHOULDER")
+        hip_line = _xyz(front_world, "RIGHT_HIP") - _xyz(front_world, "LEFT_HIP")
+        trunk_twist = transverse_twist(shoulder_line, hip_line, cfg)
+        conf["trunk_twist_deg"] = conf["trunk_sidebend_deg"]
     if _joint_ok(front_world, neck_side_needed, cfg):
         neck_side = frontal_deviation(_neck_vec(front_world), cfg)
         neck_side_conf = min(_vis(front_world, n) for n in neck_side_needed)
         conf["neck_sidebend_deg"] = neck_side_conf
+        # neck twist: ear line rotated against the shoulder line, same method
+        # as trunk twist one level up the chain (head turned relative to torso).
+        ear_line = _xyz(front_world, "RIGHT_EAR") - _xyz(front_world, "LEFT_EAR")
+        shoulder_line = _xyz(front_world, "RIGHT_SHOULDER") - _xyz(front_world, "LEFT_SHOULDER")
+        neck_twist = transverse_twist(ear_line, shoulder_line, cfg)
+        conf["neck_twist_deg"] = neck_side_conf
         # gaze continuity: signed lateral ear-midpoint offset from shoulder midpoint
         ear_mid = _midpoint(front_world, "LEFT_EAR", "RIGHT_EAR")
         sh_mid = _midpoint(front_world, "LEFT_SHOULDER", "RIGHT_SHOULDER")
@@ -255,6 +293,8 @@ def fuse(side_world: Optional[dict], front_world: Optional[dict],
         lower_arm_flexion_deg=lower_arm,
         trunk_sidebend_deg=trunk_side,
         neck_sidebend_deg=neck_side,
+        trunk_twist_deg=trunk_twist,
+        neck_twist_deg=neck_twist,
         lateral_gaze_deg=gaze_deg,
         confidence=conf,
     )
@@ -386,11 +426,19 @@ class PoseDetectorV2:
 # geometry recovers known input angles.
 # --------------------------------------------------------------------------
 
-def _make_pose(trunk_deg=0.0, neck_deg=0.0, sidebend_deg=0.0, cfg=FusionConfig) -> dict:
-    """Build a synthetic side-view world pose with a known trunk/neck flexion."""
+def _make_pose(trunk_deg=0.0, neck_deg=0.0, sidebend_deg=0.0,
+              trunk_twist_deg=0.0, neck_twist_deg=0.0, cfg=FusionConfig) -> dict:
+    """Build a synthetic world pose with known flexion/side-bend/twist. Twist
+    rotates the shoulder line relative to the hip line (trunk_twist_deg) and
+    the ear line relative to the shoulder line (neck_twist_deg) about the
+    vertical axis, in the horizontal (lateral, forward) plane."""
     up = np.zeros(3); up[cfg.WORLD_UP_AXIS] = 1.0 / cfg.WORLD_UP_SIGN
     fwd = np.zeros(3); fwd[cfg.WORLD_FWD_AXIS] = 1.0
     lat = np.zeros(3); lat[cfg.WORLD_LAT_AXIS] = 1.0
+
+    def _rotate_horiz(deg: float) -> np.ndarray:
+        r = np.radians(deg)
+        return np.cos(r) * lat + np.sin(r) * fwd
 
     hip_mid = np.zeros(3)
     tr = np.radians(trunk_deg)
@@ -403,13 +451,16 @@ def _make_pose(trunk_deg=0.0, neck_deg=0.0, sidebend_deg=0.0, cfg=FusionConfig) 
     ear_mid = sh_mid + 0.25 * (np.cos(nk) * up + np.sin(nk) * fwd)
 
     half = 0.20 * lat
+    hip_half = half
+    sh_half = 0.20 * _rotate_horiz(trunk_twist_deg)
+    ear_half = 0.5 * 0.20 * _rotate_horiz(trunk_twist_deg + neck_twist_deg)
     world = {
-        "LEFT_HIP": np.append(hip_mid - half, 1.0),
-        "RIGHT_HIP": np.append(hip_mid + half, 1.0),
-        "LEFT_SHOULDER": np.append(sh_mid - half, 1.0),
-        "RIGHT_SHOULDER": np.append(sh_mid + half, 1.0),
-        "LEFT_EAR": np.append(ear_mid - 0.5 * half, 1.0),
-        "RIGHT_EAR": np.append(ear_mid + 0.5 * half, 1.0),
+        "LEFT_HIP": np.append(hip_mid - hip_half, 1.0),
+        "RIGHT_HIP": np.append(hip_mid + hip_half, 1.0),
+        "LEFT_SHOULDER": np.append(sh_mid - sh_half, 1.0),
+        "RIGHT_SHOULDER": np.append(sh_mid + sh_half, 1.0),
+        "LEFT_EAR": np.append(ear_mid - ear_half, 1.0),
+        "RIGHT_EAR": np.append(ear_mid + ear_half, 1.0),
         "NOSE": np.append(ear_mid, 1.0),
         "LEFT_ELBOW": np.append(sh_mid - half + 0.3 * (-up) + 0.05 * fwd, 1.0),
         "RIGHT_ELBOW": np.append(sh_mid + half + 0.3 * (-up) + 0.05 * fwd, 1.0),
@@ -446,5 +497,28 @@ if __name__ == "__main__":
     front = _make_pose(trunk_deg=30, neck_deg=0)
     pa = fuse(None, front)
     print(f"  fused trunk={pa.trunk_flexion_deg:.1f}  confidence={pa.confidence['trunk_flexion_deg']:.2f}")
+
+    print("\ntwist recovery (front view): trunk_twist_deg was never computed before "
+          "this fix and always read 0 regardless of input -- this is what the "
+          "goal_controller's drot DOF actually needed and never got.")
+    twist_ok = True
+    for tw in [0, 15, -25]:
+        front = _make_pose(trunk_twist_deg=tw)
+        pa = fuse(None, front)
+        err = abs(pa.trunk_twist_deg - tw)
+        if err >= 1.5:
+            twist_ok = False
+        print(f"  input trunk_twist={tw:>4}  -> fused={pa.trunk_twist_deg:6.1f}"
+              f"{'  <-- MISMATCH' if err >= 1.5 else ''}")
+    for tw in [0, 20]:
+        front = _make_pose(neck_twist_deg=tw)
+        pa = fuse(None, front)
+        err = abs(pa.neck_twist_deg - tw)
+        if err >= 1.5:
+            twist_ok = False
+        print(f"  input neck_twist ={tw:>4}  -> fused={pa.neck_twist_deg:6.1f}"
+              f"{'  <-- MISMATCH' if err >= 1.5 else ''}")
+    ok = ok and twist_ok
+    print("\nall geometry checks passed" if ok else "\nSOME CHECKS FAILED")
 
     print(f"\nall sagittal recoveries within tolerance: {ok}")
