@@ -297,7 +297,7 @@ class CameraConfig:
     # Physical camera indices or device paths, by role. Set at wiring time.
     # Unused roles stay None. On Linux prefer /dev/v4l/by-id/... paths, which
     # survive a replug; integer indices do not.
-    SIDE_SOURCE = 0
+    SIDE_SOURCE = 2
     FRONT_SOURCE = 1
     OBLIQUE_SOURCE = None
 

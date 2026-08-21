@@ -113,7 +113,7 @@ def build_stack(condition: str, simulate: bool, model_path: str,
 
 def run(participant: str, condition: str, minutes: float, simulate: bool,
         model_path: str, log_dir: str, calib_s: float,
-        side_index=None, front_index=None):
+        side_index=None, front_index=None, preview=False):
     from session_logger_v2 import SessionLoggerV2
 
     dual, det_side, det_front, pss, ctrl, robot, fuse = build_stack(
@@ -145,7 +145,22 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
                 time.sleep(0.005)
                 continue
             ms = int(time.time() * 1000) - base_ms
-            samples.append(fuse(_det(det_side, sf, ms), _det(det_front, ff, ms)))
+            sw = _det(det_side, sf, ms)
+            fw = _det(det_front, ff, ms)
+            samples.append(fuse(sw, fw))
+            if preview:
+                import cv2
+                if sf is not None:
+                    f1 = cv2.resize(sf, (480, 360))
+                    cv2.putText(f1, f"CALIBRATING... {len(samples)} samples",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.imshow("side camera", f1)
+                if ff is not None:
+                    f2 = cv2.resize(ff, (480, 360))
+                    cv2.putText(f2, f"CALIBRATING... {len(samples)} samples",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.imshow("front camera", f2)
+                cv2.waitKey(1)
             time.sleep(0.02)
         if len(samples) < 30:
             raise RuntimeError(f"only {len(samples)} calibration samples; "
@@ -165,7 +180,9 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
                 time.sleep(0.005)
                 continue
             ms = int(time.time() * 1000) - base_ms
-            angles = fuse(_det(det_side, sf, ms), _det(det_front, ff, ms))
+            side_world = _det(det_side, sf, ms)
+            front_world = _det(det_front, ff, ms)
+            angles = fuse(side_world, front_world)
             comp = pss.compute(angles)
 
             log.log_frame(angles, comp,
@@ -187,11 +204,60 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
             # neutral console output: gives no cue about the condition
             print(f"  t={time.time()-t0:5.0f}s  frames={frames}", end="\r")
 
+            if preview:
+                import cv2
+                def _draw(label, frame, world_dict, ang, comp):
+                    if frame is None:
+                        return
+                    frame = cv2.resize(frame, (480, 360))
+                    h, w = frame.shape[:2]
+                    # draw skeleton from normalized landmarks
+                    if world_dict and "_normalized" in world_dict:
+                        nl = world_dict["_normalized"]
+                        connections = [
+                            (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+                            (11, 23), (12, 24), (23, 24), (23, 25), (24, 26),
+                            (0, 7), (0, 8), (7, 11), (8, 12),
+                        ]
+                        pts = {}
+                        for lm_idx in set(sum(connections, ())):
+                            if lm_idx < len(nl):
+                                lm = nl[lm_idx]
+                                pts[lm_idx] = (int(lm.x * w), int(lm.y * h))
+                        for a, b in connections:
+                            if a in pts and b in pts:
+                                cv2.line(frame, pts[a], pts[b], (255, 255, 255), 1)
+                        for idx, pt in pts.items():
+                            cv2.circle(frame, pt, 3, (0, 255, 0), -1)
+                    # overlay
+                    pss = comp['pss_smooth']
+                    color = (0, 255, 0) if pss < 0.25 else \
+                            (0, 165, 255) if pss < 0.5 else (0, 0, 255)
+                    info = [
+                        f"trunk: {ang.trunk_flexion_deg:.1f}",
+                        f"neck:  {ang.neck_flexion_deg:.1f}",
+                        f"side:  {ang.trunk_sidebend_deg:.1f}",
+                        f"PSS:   {pss:.3f}",
+                    ]
+                    cv2.rectangle(frame, (0, 0), (200, 25 + len(info) * 22), (0, 0, 0), -1)
+                    for i, txt in enumerate(info):
+                        cv2.putText(frame, txt, (8, 20 + i * 22),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    cv2.imshow(label, frame)
+                _draw("side camera", sf, side_world, angles, comp)
+                _draw("front camera", ff, front_world, angles, comp)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    logger.info("\npreview closed by user")
+                    break
+
         logger.info(f"\ntask phase complete: {frames} frames")
 
     except KeyboardInterrupt:
         logger.info("\ninterrupted by operator; closing session cleanly")
     finally:
+        if preview:
+            import cv2
+            cv2.destroyAllWindows()
         try:
             import camera_config as _cc
             log.close(notes=f"condition={condition}; simulate={simulate}\n"
@@ -225,6 +291,8 @@ def main(argv=None):
                    help="no robot hardware (default)")
     g.add_argument("--live", dest="simulate", action="store_false",
                    help="drive the real UR3 over RTDE")
+    p.add_argument("--preview", action="store_true", default=False,
+                   help="show live camera feeds with pose skeleton overlay")
     a = p.parse_args(argv)
 
     if a.camera_layout:
@@ -238,7 +306,7 @@ def main(argv=None):
         logger.warning("LIVE MODE: the UR3 will move. Confirm the workspace is "
                        "clear and RobotConfig has been set for this rig.")
     run(a.participant, a.condition, a.minutes, a.simulate, a.model,
-        a.log_dir, a.calibration_seconds, a.side_index, a.front_index)
+        a.log_dir, a.calibration_seconds, a.side_index, a.front_index, preview=a.preview)
     return 0
 
 

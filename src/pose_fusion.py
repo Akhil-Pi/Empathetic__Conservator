@@ -371,7 +371,11 @@ class PoseDetectorV2:
             return None
         if not result.pose_world_landmarks:
             return None
-        return _landmarks_to_dict(result.pose_world_landmarks[0])
+        world = _landmarks_to_dict(result.pose_world_landmarks[0])
+        # attach normalized landmarks for optional skeleton drawing
+        if result.pose_landmarks:
+            world["_normalized"] = result.pose_landmarks[0]
+        return world
 
     def close(self):
         self.landmarker.close()
