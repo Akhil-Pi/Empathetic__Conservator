@@ -550,6 +550,26 @@ def test_front_sagittal_fallback_is_off_by_default():
 
 
 @test
+def test_frontal_angle_confidence_is_populated_and_scaled():
+    """REGRESSION: fuse() never wrote a confidence entry for trunk_sidebend_deg
+    / neck_sidebend_deg / lateral_gaze_deg, so apply_layout_mask's confidence
+    scaling silently no-opped for them on every layout, including degraded
+    ones like SIDE_FRONT_OBLIQUE that are supposed to show up in the logs."""
+    from pose_fusion import fuse, apply_layout_mask, _make_pose
+    from camera_config import LAYOUTS
+    pa = fuse(None, _make_pose(sidebend_deg=20))
+    for name in ("trunk_sidebend_deg", "neck_sidebend_deg", "lateral_gaze_deg"):
+        assert pa.confidence.get(name) == 1.0, \
+            f"fuse() must record a confidence for {name}, got {pa.confidence.get(name)}"
+
+    masked = apply_layout_mask(pa, LAYOUTS["SIDE_FRONT_OBLIQUE"])
+    for name in ("trunk_sidebend_deg", "neck_sidebend_deg", "lateral_gaze_deg"):
+        assert abs(masked.confidence[name] - 0.8) < 1e-9, \
+            (f"SIDE_FRONT_OBLIQUE must scale {name} confidence to 0.8, "
+             f"got {masked.confidence[name]}")
+
+
+@test
 def test_single_camera_capture_allowed():
     import camera_stream as cs
     assert "side_source=None" in cs.DualCamera.__init__.__doc__ or True

@@ -212,16 +212,22 @@ def fuse(side_world: Optional[dict], front_world: Optional[dict],
     trunk_side = 0.0
     neck_side = 0.0
     gaze_deg = 0.0
-    if _joint_ok(front_world, ["LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"], cfg):
+    trunk_side_needed = ["LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"]
+    neck_side_needed = ["LEFT_EAR", "RIGHT_EAR", "LEFT_SHOULDER", "RIGHT_SHOULDER"]
+    if _joint_ok(front_world, trunk_side_needed, cfg):
         trunk_side = frontal_deviation(_trunk_vec(front_world), cfg)
-    if _joint_ok(front_world, ["LEFT_EAR", "RIGHT_EAR", "LEFT_SHOULDER", "RIGHT_SHOULDER"], cfg):
+        conf["trunk_sidebend_deg"] = min(_vis(front_world, n) for n in trunk_side_needed)
+    if _joint_ok(front_world, neck_side_needed, cfg):
         neck_side = frontal_deviation(_neck_vec(front_world), cfg)
+        neck_side_conf = min(_vis(front_world, n) for n in neck_side_needed)
+        conf["neck_sidebend_deg"] = neck_side_conf
         # gaze continuity: signed lateral ear-midpoint offset from shoulder midpoint
         ear_mid = _midpoint(front_world, "LEFT_EAR", "RIGHT_EAR")
         sh_mid = _midpoint(front_world, "LEFT_SHOULDER", "RIGHT_SHOULDER")
         gaze_deg = float(np.degrees(np.arctan2(
             (ear_mid[cfg.WORLD_LAT_AXIS] - sh_mid[cfg.WORLD_LAT_AXIS]),
             abs((ear_mid[cfg.WORLD_UP_AXIS] - sh_mid[cfg.WORLD_UP_AXIS])) + 1e-6)))
+        conf["lateral_gaze_deg"] = neck_side_conf
 
     # ---- arm (prefer side; near arm is well seen from the side) ----
     upper_arm, lower_arm, aconf = 20.0, 90.0, 0.0
