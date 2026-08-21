@@ -226,6 +226,24 @@ def test_latency_uses_wall_clock():
 
 
 @test
+def test_drot_direction_uses_trunk_twist():
+    """REGRESSION: drot direction ignored trunk_twist_deg entirely and fell
+    back to a fixed sign whenever neck_twist_deg and neck_sidebend_deg were
+    both zero, even though trunk_twist_deg is a valid GAINS/DOF_REQUIRES
+    driver of drot."""
+    from pss_v2 import PSSv2Calculator, PostureAngles
+    from goal_controller import GoalBasedController, _FakeRobot
+    ctrl = GoalBasedController("experimental", PSSv2Calculator())
+    robot = _FakeRobot()
+    ang = PostureAngles(trunk_twist_deg=-25)  # neck_twist_deg, neck_sidebend_deg default to 0
+    ctrl._execute({"drot": 0.2}, ang, robot)
+    kind, applied = robot.moves[-1]
+    assert kind == "adjust_rotation"
+    assert applied > 0, \
+        "drot sign must follow trunk_twist_deg, not fall back to a fixed default"
+
+
+@test
 def test_predicted_pss_is_pss_not_cost():
     """REGRESSION: predicted_pss_before/after used to carry optimizer COST,
     which includes effort and overcorrection penalties, under a PSS label."""

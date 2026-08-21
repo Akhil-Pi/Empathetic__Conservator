@@ -369,7 +369,10 @@ class GoalBasedController:
 
         # Direction from observed signed lean/twist; magnitude from the optimiser.
         side_sign = np.sign(angles.trunk_sidebend_deg) or 1.0
-        twist_sign = np.sign(angles.neck_twist_deg or angles.neck_sidebend_deg) or 1.0
+        twist_sign = (np.sign(angles.trunk_twist_deg)
+                      or np.sign(angles.neck_twist_deg)
+                      or np.sign(angles.neck_sidebend_deg)
+                      or 1.0)
         dx = abs(delta.get("dx", 0.0)) * (-side_sign) * self.cfg.LATERAL_SIGN
         drot = abs(delta.get("drot", 0.0)) * (-twist_sign) * self.cfg.LATERAL_SIGN
 
