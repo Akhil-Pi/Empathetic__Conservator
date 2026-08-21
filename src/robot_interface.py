@@ -70,7 +70,7 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 
 class RobotConfig:
-    IP = "192.168.1.100"          # set to the Pilot Factory UR3 address
+    IP = "192.168.1.10"          # set to the Pilot Factory UR3 address
 
     # Conservative motion near a person. Slower is safer, but note that motion
     # time lands inside the measured intervention latency, which is an input to
@@ -82,9 +82,9 @@ class RobotConfig:
     # Absolute workspace envelope in the ROBOT BASE frame (metres). This bounds
     # the accumulation of interventions. Measure these on the rig and tighten
     # them; the defaults are placeholders that MUST be set before live running.
-    ENVELOPE_MIN = (-0.30, -0.45, 0.02)   # (x, y, z)
-    ENVELOPE_MAX = (0.30, -0.15, 0.35)
-    ENVELOPE_VERIFIED = False     # flip to True once measured on the rig
+    ENVELOPE_MIN = (-0.20, -0.40, 0.05)   # (x, y, z)
+    ENVELOPE_MAX = (0.20, -0.15, 0.30)
+    ENVELOPE_VERIFIED = True     # flip to True once measured on the rig
 
     # Absolute orientation bound, radians from the baseline orientation.
     # Tighter than ControllerConfig.STEP_LIMIT["dtilt"] on purpose: a single
@@ -95,7 +95,9 @@ class RobotConfig:
 
     # Baseline artifact pose, identical in BOTH conditions (the confound fix).
     # [x, y, z, rx, ry, rz]; rotation is an axis-angle vector.
-    BASELINE_POSE = [252.60, 130.75, 72.53, 0.018, -4.067, 0.043]
+    #BASELINE_POSE = [252.60, 130.75, 72.53, 0.018, -4.067, 0.043]
+
+    BASELINE_POSE = [-0.2526, -0.1308, 0.4725, -2.7938, -0.0124, 1.3948]
 
     # ---- singularity avoidance ----
     # Sessions kept ending in a singularity. A Cartesian box does not prevent
