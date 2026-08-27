@@ -150,6 +150,17 @@ class ControllerConfig:
     SUSTAINED_S = 2.0
     COOLDOWN_S = 2.0
 
+    # Branch policy: use directly interpretable interventions for rig testing.
+    # Head/gaze rotation rotates only the fixture axis; forward lean raises the
+    # fixture slowly. These thresholds are intentionally simple so the live test
+    # can validate signs before returning to a more ambitious optimiser.
+    HEAD_TURN_TRIGGER_DEG = 8.0
+    HEAD_TURN_SATURATION_DEG = 30.0
+    FORWARD_LEAN_TRIGGER_DEG = 15.0
+    FORWARD_LEAN_SATURATION_DEG = 45.0
+    HEAD_ROT_STEP_RAD = 0.08
+    FORWARD_RAISE_STEP_M = 0.015
+
     # Optimiser resolution.
     LINE_SEARCH_POINTS = 21
     COORD_DESCENT_PASSES = 3
@@ -170,7 +181,8 @@ DOF_REQUIRES = {
     "dy":    ("trunk_flexion_deg",),
     "dtilt": ("neck_flexion_deg",),
     "dx":    ("trunk_sidebend_deg", "neck_sidebend_deg"),
-    "drot":  ("trunk_twist_deg", "neck_twist_deg", "neck_sidebend_deg"),
+    "drot":  ("trunk_twist_deg", "neck_twist_deg", "neck_sidebend_deg",
+              "lateral_gaze_deg"),
 }
 
 
@@ -391,8 +403,10 @@ class GoalBasedController:
                           self.cfg.EPISODE_DECAY_FLOOR)
         step_cfg = _scaled_step_cfg(self.cfg, decay_scale)
         self._episode_fires += 1
-        delta, cost_before, cost_after = optimize_target(
-            angles, self.pss_calc, step_cfg, dof=self.dof, extra_cost=extra_cost)
+        delta = self._rule_target(angles, pss_components, step_cfg)
+        cost_before = ergonomic_cost(angles, {d: 0.0 for d in self.cfg.DOF},
+                                     self.pss_calc, step_cfg, extra_cost)
+        cost_after = ergonomic_cost(angles, delta, self.pss_calc, step_cfg, extra_cost)
 
         # Pure predicted PSS for logging. The optimizer costs above include the
         # effort and overcorrection penalties, so they must not be reported as
@@ -400,6 +414,7 @@ class GoalBasedController:
         pss_before = _score_once(angles, self.pss_calc)
         pss_after = _score_once(predict_angles(angles, delta, self.cfg), self.pss_calc)
 
+        command_delta = self._execution_delta(delta, angles)
         moved = self._execute(delta, angles, robot)
         # latency is a physical measurement: always the real wall clock, even if
         # the trigger logic is driven by an injected `now` (replay / testing).
@@ -416,6 +431,8 @@ class GoalBasedController:
             "interventions": [(k, round(v, 4)) for k, v in delta.items() if abs(v) > 1e-4],
             "intervention_id": self._count,
             "delta": delta,
+            "command_delta": command_delta,
+            "policy": "head_gaze_rotation",
             "predicted_pss_before": round(pss_before, 4),
             "predicted_pss_after": round(pss_after, 4),
             "cost_before": round(cost_before, 4),
@@ -427,27 +444,48 @@ class GoalBasedController:
         })
         logger.info(f"[GOAL] #{self._count} pss={pss:.3f} "
                     f"delta={result['interventions']} "
+                    f"command={[(k, round(v, 4)) for k, v in command_delta.items()]} "
                     f"predicted PSS {pss_before:.3f}->{pss_after:.3f} "
                     f"(cost {cost_before:.3f}->{cost_after:.3f})")
         return result
+
+    def _rule_target(self, angles: PostureAngles, pss_components: dict,
+                     cfg=ControllerConfig) -> Dict[str, float]:
+        """Simple rig-test policy: head/gaze -> rotate, forward lean -> raise."""
+        delta = {d: 0.0 for d in cfg.DOF}
+
+        head_signal = (
+            angles.lateral_gaze_deg
+            if abs(angles.lateral_gaze_deg) >= cfg.HEAD_TURN_TRIGGER_DEG
+            else angles.neck_twist_deg
+        )
+        if abs(head_signal) >= cfg.HEAD_TURN_TRIGGER_DEG and "drot" in self.dof:
+            scale = min(abs(head_signal) / cfg.HEAD_TURN_SATURATION_DEG, 1.0)
+            delta["drot"] = min(cfg.HEAD_ROT_STEP_RAD * scale,
+                                 cfg.STEP_LIMIT["drot"])
+            return delta
+
+        trunk_flex = pss_components.get("trunk_flexion_deg", angles.trunk_flexion_deg)
+        neck_flex = pss_components.get("neck_flexion_deg", angles.neck_flexion_deg)
+        forward_signal = max(float(trunk_flex), float(neck_flex))
+        if forward_signal >= cfg.FORWARD_LEAN_TRIGGER_DEG and "dz" in self.dof:
+            scale = min(forward_signal / cfg.FORWARD_LEAN_SATURATION_DEG, 1.0)
+            delta["dz"] = min(cfg.FORWARD_RAISE_STEP_M * scale,
+                               cfg.STEP_LIMIT["dz"])
+
+        return delta
 
     def _execute(self, delta: Dict[str, float], angles: PostureAngles, robot) -> bool:
         """One smooth move to the target. Translations + tilt via move_relative;
         rotation about vertical via adjust_rotation. Lateral and rotation take
         their MAGNITUDE from the optimiser and their DIRECTION from the observed
         lean/twist, so the artifact tracks toward the strained side."""
-        dz = delta.get("dz", 0.0)
-        dy = delta.get("dy", 0.0)
-        dtilt = delta.get("dtilt", 0.0)
-
-        # Direction from observed signed lean/twist; magnitude from the optimiser.
-        side_sign = np.sign(angles.trunk_sidebend_deg) or 1.0
-        twist_sign = (np.sign(angles.trunk_twist_deg)
-                      or np.sign(angles.neck_twist_deg)
-                      or np.sign(angles.neck_sidebend_deg)
-                      or 1.0)
-        dx = abs(delta.get("dx", 0.0)) * (-side_sign) * self.cfg.LATERAL_SIGN
-        drot = abs(delta.get("drot", 0.0)) * (-twist_sign) * self.cfg.LATERAL_SIGN
+        command = self._execution_delta(delta, angles)
+        dz = command["dz"]
+        dy = command["dy"]
+        dtilt = command["dtilt"]
+        dx = command["dx"]
+        drot = command["drot"]
 
         ok = True
         if any(abs(v) > 1e-4 for v in (dx, dy, dz, dtilt)):
@@ -455,6 +493,25 @@ class GoalBasedController:
         if abs(drot) > 1e-4:
             robot.adjust_rotation(drot)
         return bool(ok)
+
+    def _execution_delta(self, delta: Dict[str, float], angles: PostureAngles) -> Dict[str, float]:
+        """Signed command that will be sent to the robot for a controller delta."""
+        dz = delta.get("dz", 0.0)
+        dy = delta.get("dy", 0.0)
+        dtilt = delta.get("dtilt", 0.0)
+
+        # Direction from observed signed lean/twist; magnitude from the policy.
+        side_sign = np.sign(angles.trunk_sidebend_deg) or 1.0
+        twist_sign = (np.sign(angles.trunk_twist_deg)
+                      or np.sign(angles.neck_twist_deg)
+                      or np.sign(angles.neck_sidebend_deg)
+                      or np.sign(angles.lateral_gaze_deg)
+                      or 1.0)
+        dx = abs(delta.get("dx", 0.0)) * (-side_sign) * self.cfg.LATERAL_SIGN
+        drot = abs(delta.get("drot", 0.0)) * (-twist_sign) * self.cfg.LATERAL_SIGN
+        return {"dx": float(dx), "dy": float(dy), "dz": float(dz),
+                "dtilt": float(dtilt), "drot": float(drot),
+                "side_sign": float(side_sign), "twist_sign": float(twist_sign)}
 
 
 # --------------------------------------------------------------------------
