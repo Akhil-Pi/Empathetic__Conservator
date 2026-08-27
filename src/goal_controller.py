@@ -400,6 +400,7 @@ class GoalBasedController:
         pss_before = _score_once(angles, self.pss_calc)
         pss_after = _score_once(predict_angles(angles, delta, self.cfg), self.pss_calc)
 
+        command_delta = self._execution_delta(delta, angles)
         moved = self._execute(delta, angles, robot)
         # latency is a physical measurement: always the real wall clock, even if
         # the trigger logic is driven by an injected `now` (replay / testing).
@@ -416,6 +417,17 @@ class GoalBasedController:
             "interventions": [(k, round(v, 4)) for k, v in delta.items() if abs(v) > 1e-4],
             "intervention_id": self._count,
             "delta": delta,
+            "command_delta": command_delta,
+            "diagnostic_angles": {
+                "trunk_flexion_deg": angles.trunk_flexion_deg,
+                "neck_flexion_deg": angles.neck_flexion_deg,
+                "trunk_sidebend_deg": angles.trunk_sidebend_deg,
+                "neck_sidebend_deg": angles.neck_sidebend_deg,
+                "trunk_twist_deg": angles.trunk_twist_deg,
+                "neck_twist_deg": angles.neck_twist_deg,
+                "lateral_gaze_deg": angles.lateral_gaze_deg,
+            },
+            "diagnostic_confidence": dict(getattr(angles, "confidence", None) or {}),
             "predicted_pss_before": round(pss_before, 4),
             "predicted_pss_after": round(pss_after, 4),
             "cost_before": round(cost_before, 4),
@@ -427,6 +439,7 @@ class GoalBasedController:
         })
         logger.info(f"[GOAL] #{self._count} pss={pss:.3f} "
                     f"delta={result['interventions']} "
+                    f"command={[(k, round(v, 4)) for k, v in command_delta.items()]} "
                     f"predicted PSS {pss_before:.3f}->{pss_after:.3f} "
                     f"(cost {cost_before:.3f}->{cost_after:.3f})")
         return result
@@ -436,6 +449,22 @@ class GoalBasedController:
         rotation about vertical via adjust_rotation. Lateral and rotation take
         their MAGNITUDE from the optimiser and their DIRECTION from the observed
         lean/twist, so the artifact tracks toward the strained side."""
+        command = self._execution_delta(delta, angles)
+        dz = command["dz"]
+        dy = command["dy"]
+        dtilt = command["dtilt"]
+        dx = command["dx"]
+        drot = command["drot"]
+
+        ok = True
+        if any(abs(v) > 1e-4 for v in (dx, dy, dz, dtilt)):
+            ok = robot.move_relative(dx=dx, dy=dy, dz=dz, drx=dtilt, asynchronous=True)
+        if abs(drot) > 1e-4:
+            robot.adjust_rotation(drot)
+        return bool(ok)
+
+    def _execution_delta(self, delta: Dict[str, float], angles: PostureAngles) -> Dict[str, float]:
+        """Signed command that will be sent to the robot for a controller delta."""
         dz = delta.get("dz", 0.0)
         dy = delta.get("dy", 0.0)
         dtilt = delta.get("dtilt", 0.0)
@@ -448,13 +477,8 @@ class GoalBasedController:
                       or 1.0)
         dx = abs(delta.get("dx", 0.0)) * (-side_sign) * self.cfg.LATERAL_SIGN
         drot = abs(delta.get("drot", 0.0)) * (-twist_sign) * self.cfg.LATERAL_SIGN
-
-        ok = True
-        if any(abs(v) > 1e-4 for v in (dx, dy, dz, dtilt)):
-            ok = robot.move_relative(dx=dx, dy=dy, dz=dz, drx=dtilt, asynchronous=True)
-        if abs(drot) > 1e-4:
-            robot.adjust_rotation(drot)
-        return bool(ok)
+        return {"dx": dx, "dy": dy, "dz": dz, "dtilt": dtilt, "drot": drot,
+                "side_sign": float(side_sign), "twist_sign": float(twist_sign)}
 
 
 # --------------------------------------------------------------------------
