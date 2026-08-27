@@ -99,6 +99,18 @@ class RobotConfig:
 
     BASELINE_POSE = [-0.2526, -0.1308, 0.4725, -2.7938, -0.0124, 1.3948]
 
+    # ---- human frame to UR base frame mapping ----
+    # The controller reasons in a person/artifact frame:
+    #   dx = toward the person's left
+    #   dy = toward the person's front
+    #   dz = up
+    # The UR accepts Cartesian translations in its base frame. Measure these
+    # unit vectors on the rig and adjust signs before live testing.
+    HUMAN_LEFT_IN_BASE = (1.0, 0.0, 0.0)
+    HUMAN_FORWARD_IN_BASE = (0.0, 1.0, 0.0)
+    HUMAN_UP_IN_BASE = (0.0, 0.0, 1.0)
+    HUMAN_ROT_SIGN = 1.0
+
     # ---- singularity avoidance ----
     # Sessions kept ending in a singularity. A Cartesian box does not prevent
     # that: a box still contains the central cylinder around the base axis and
@@ -188,6 +200,14 @@ def angle_between_rotvecs(a, b) -> float:
     """Magnitude of the rotation taking orientation a to orientation b (rad)."""
     R = rotvec_to_matrix(b) @ rotvec_to_matrix(a).T
     return float(np.linalg.norm(matrix_to_rotvec(R)))
+
+
+def _unit(v) -> np.ndarray:
+    v = np.asarray(v, float)
+    n = np.linalg.norm(v)
+    if n < 1e-12:
+        raise ValueError("frame mapping vector must be non-zero")
+    return v / n
 
 
 # --------------------------------------------------------------------------
@@ -380,9 +400,38 @@ class _RobotBase:
             logger.info("[ROBOT] move clamped by workspace envelope")
         return bool(ok)
 
+    def map_human_translation(self, dx: float = 0.0, dy: float = 0.0,
+                              dz: float = 0.0) -> np.ndarray:
+        """Translate semantic human-frame deltas into UR base-frame deltas."""
+        left = _unit(self.cfg.HUMAN_LEFT_IN_BASE)
+        forward = _unit(self.cfg.HUMAN_FORWARD_IN_BASE)
+        up = _unit(self.cfg.HUMAN_UP_IN_BASE)
+        return float(dx) * left + float(dy) * forward + float(dz) * up
+
+    def move_human_relative(self, dx: float = 0.0, dy: float = 0.0,
+                            dz: float = 0.0, drx: float = 0.0,
+                            asynchronous: bool = True) -> bool:
+        """Move using controller semantic axes instead of raw UR base axes."""
+        base = self.map_human_translation(dx, dy, dz)
+        ok = self.move_relative(dx=float(base[0]), dy=float(base[1]),
+                                dz=float(base[2]), drx=drx,
+                                asynchronous=asynchronous)
+        self.last_move["human_requested"] = [round(float(v), 5)
+                                             for v in (dx, dy, dz, drx)]
+        self.last_move["base_mapped"] = [round(float(v), 5) for v in base]
+        return ok
+
     def adjust_rotation(self, drot: float) -> bool:
         """Rotation about the base vertical (Z) axis."""
         return self.move_relative(drz=drot, asynchronous=True)
+
+    def adjust_human_rotation(self, drot: float) -> bool:
+        """Rotate fixture using the calibrated human-frame sign convention."""
+        base_drot = float(drot) * float(self.cfg.HUMAN_ROT_SIGN)
+        ok = self.adjust_rotation(base_drot)
+        self.last_move["human_rotation_requested"] = round(float(drot), 5)
+        self.last_move["base_rotation_mapped"] = round(base_drot, 5)
+        return ok
 
 
 # --------------------------------------------------------------------------
