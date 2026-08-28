@@ -197,13 +197,15 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
             if result.get("triggered"):
                 lm = getattr(robot, "last_move", {}) or {}
                 command = result.get("command_delta", {}) or {}
+                diag_angles = result.get("diagnostic_angles", {}) or {}
                 log.log_event("intervention", comp["pss_smooth"], result=result,
                               details=f"clamped={lm.get('clamped')} "
                                       f"applied={lm.get('applied')} "
                                       f"ok={lm.get('ok')} "
                                       f"singularity={lm.get('singularity')} "
                                       f"policy={result.get('policy')} "
-                                      f"command={command}")
+                                      f"command={command} "
+                                      f"angles={diag_angles}")
                 if lm.get("singularity"):
                     logger.warning(f"intervention refused near a "
                                    f"{lm['singularity']} singularity")
