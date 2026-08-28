@@ -93,6 +93,17 @@ class RobotConfig:
     MAX_TILT_RAD = 0.35
     MAX_ROT_RAD = 0.60
 
+    # adjust_rotation() drives J6 (wrist 3) directly in joint space, spinning
+    # the tool about its own flange-normal axis -- the axis the artifact is
+    # actually mounted on. A Cartesian base-frame reorientation via moveL was
+    # tried first, but IK is then free to satisfy "keep TCP position fixed"
+    # by moving OTHER joints too, which live testing showed as visible motion
+    # on axes other than the intended spin. J6 has no such ambiguity: it is
+    # always the same joint, so the visible motion is always a clean spin.
+    # MAX_ROT_RAD above still bounds the cumulative rotation since baseline.
+    ROTATION_JOINT_SPEED = 0.1     # rad/s
+    ROTATION_JOINT_ACCEL = 0.1     # rad/s^2
+
     # Baseline artifact pose, identical in BOTH conditions (the confound fix).
     # [x, y, z, rx, ry, rz]; rotation is an axis-angle vector.
     #BASELINE_POSE = [252.60, 130.75, 72.53, 0.018, -4.067, 0.043]
@@ -206,6 +217,7 @@ class _RobotBase:
                           "clamped": False, "ok": False, "singularity": None}
         self._moves = 0
         self._sing_blocks = 0
+        self._rotation_accum_rad = 0.0     # cumulative J6 rotation since baseline
         self.kin: URKinematics = getattr(cfg, "KINEMATICS", UR3_NOMINAL)
         self.th: SingularityThresholds = DEFAULT_THRESHOLDS
 
@@ -318,6 +330,7 @@ class _RobotBase:
         and predictable Cartesian path matters because someone is close.
         """
         ok = self._move_baseline_impl(asynchronous)
+        self._rotation_accum_rad = 0.0
         self.last_move = {"requested": self.baseline.tolist(),
                           "applied": self.baseline.tolist(),
                           "clamped": False, "ok": bool(ok), "singularity": None}
@@ -466,6 +479,53 @@ class UR3Robot(_RobotBase):
         except Exception as e:
             logger.error(f"[ROBOT] moveL failed: {e}")
             return False
+
+    def adjust_rotation(self, drot: float) -> bool:
+        """Rotate J6 (wrist 3) directly in joint space, spinning the tool
+        about its own flange-normal axis. Overrides the base class's
+        Cartesian version (base-frame reorientation via moveL), which live
+        testing showed can visibly move OTHER joints too -- IK is free to
+        satisfy "keep TCP position fixed" however it likes, and nothing
+        pins the motion to a clean, predictable spin. J6 has no such
+        ambiguity. Cumulative rotation since baseline is capped at
+        cfg.MAX_ROT_RAD, mirroring the base class's orientation clamp."""
+        if self.cfg.REQUIRE_SAFE_MODE and not self.is_safe():
+            logger.warning("[ROBOT] unsafe state, rotation refused")
+            self.last_move = {"requested": [0.0, 0.0, 0.0, drot], "applied": None,
+                              "clamped": False, "ok": False, "singularity": None}
+            return False
+
+        new_accum = self._rotation_accum_rad + drot
+        clamped = False
+        if abs(new_accum) > self.cfg.MAX_ROT_RAD:
+            new_accum = self.cfg.MAX_ROT_RAD if new_accum > 0 else -self.cfg.MAX_ROT_RAD
+            drot = new_accum - self._rotation_accum_rad
+            clamped = True
+
+        try:
+            q = list(map(float, self.rtde_r.getActualQ()))
+        except Exception as e:
+            logger.error(f"[ROBOT] could not read joints for rotation: {e}")
+            self.last_move = {"requested": [0.0, 0.0, 0.0, drot], "applied": None,
+                              "clamped": clamped, "ok": False, "singularity": None}
+            return False
+        q[5] += drot
+
+        ok = False
+        try:
+            ok = bool(self.rtde_c.moveJ(q, self.cfg.ROTATION_JOINT_SPEED,
+                                        self.cfg.ROTATION_JOINT_ACCEL, True))
+        except Exception as e:
+            logger.error(f"[ROBOT] rotation moveJ failed: {e}")
+
+        if ok:
+            self._rotation_accum_rad = new_accum
+        self.last_move = {"requested": [0.0, 0.0, 0.0, drot],
+                          "applied": [0.0, 0.0, 0.0, drot] if ok else None,
+                          "clamped": clamped, "ok": ok, "singularity": None}
+        if clamped:
+            logger.info("[ROBOT] rotation clamped by MAX_ROT_RAD cumulative budget")
+        return ok
 
     # ---- exact singularity margins from the robot's own kinematics ----
 
