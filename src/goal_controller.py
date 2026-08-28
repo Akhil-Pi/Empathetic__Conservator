@@ -133,11 +133,27 @@ class ControllerConfig:
     EPISODE_DECAY_FLOOR = 0.2
 
     # Direction the artifact moves to counter an observed lean/twist. The
-    # optimiser picks the lateral/rotation MAGNITUDE; this sign sets the
-    # physical direction. +1 means "shift/rotate opposite the observed sign"
-    # (the intuitive counter-move). Confirm once on the rig: have someone lean
-    # left and check the artifact tracks toward them, not away.
-    LATERAL_SIGN = +1.0
+    # optimiser picks the MAGNITUDE (see optimize_target); these signs set the
+    # physical direction. Kept as two SEPARATE constants -- translation and
+    # rotation are physically different motions and there is no reason a
+    # fix to one direction should silently also flip the other, which reusing
+    # one constant for both did. +1 means "shift/rotate opposite the observed
+    # sign" (the intuitive counter-move: lean left -> artifact comes toward
+    # your left). Confirm each independently on the rig.
+    LATERAL_SIGN = +1.0     # sign for dx (lateral shift), person-relative
+    ROTATION_SIGN = +1.0    # sign for drot (rotation about vertical)
+
+    # Below-threshold return-to-baseline. Without this, the artifact only
+    # ever moves AWAY from baseline (an intervention fires, corrects, and then
+    # simply stays put) -- reported as "unidirectional": lean once and every
+    # later move keeps compounding in whatever direction that first lean
+    # pushed, because nothing ever pulls it back. RETURN_GAIN is the fraction
+    # of the remaining base-frame displacement closed per below-threshold
+    # cycle (a gentle exponential approach to baseline, not a snap), still
+    # capped by STEP_LIMIT per axis so it never moves faster than a real
+    # intervention would.
+    RETURN_GAIN = 0.3
+    RETURN_DEADBAND_M = 0.004   # do not bother "returning" sub-4mm noise
 
     LAMBDA_SINGULARITY = 0.20   # weight on the singularity term. PSS lives in
                                 # [0, 1] and the singularity penalty is capped
@@ -361,14 +377,16 @@ class GoalBasedController:
             result["reason"] = "cooldown"
             return result
 
-        # Below threshold: nothing to do. This also ends the current escalation
-        # episode (see EPISODE_DECAY) -- the strain that started it is gone, so
-        # a future trigger is a fresh problem, not a continuation, and should
-        # get a full-size step again rather than an ever-shrinking leftover.
+        # Below threshold: nothing new to correct. This also ends the current
+        # escalation episode (see EPISODE_DECAY) -- the strain that started it
+        # is gone, so a future trigger is a fresh problem, not a continuation,
+        # and should get a full-size step again rather than an ever-shrinking
+        # leftover.
         if pss < self.cfg.THRESHOLD:
             self._above_since = None
             self._episode_fires = 0
-            result["reason"] = "below_threshold"
+            moved_home = self._drift_toward_baseline(robot, now)
+            result["reason"] = "returning_to_baseline" if moved_home else "below_threshold"
             return result
 
         # Sustained-dwell timer (ignore momentary spikes).
@@ -431,13 +449,76 @@ class GoalBasedController:
                     f"(cost {cost_before:.3f}->{cost_after:.3f})")
         return result
 
+    def _drift_toward_baseline(self, robot, now: float) -> bool:
+        """
+        If the artifact is displaced from baseline and strain has been below
+        threshold for a full cooldown, close part of that gap. Base-frame
+        only (baseline and current pose are both already in the robot's own
+        frame, so no person/base conversion is needed here, unlike _execute).
+        Position only for now; returning tilt/rotation toward baseline the
+        same way is a reasonable follow-up but is not implemented here.
+        """
+        if self.condition != "experimental":
+            return False
+        if (now - self._last_intervention_at) <= self.cfg.COOLDOWN_S:
+            return False
+        baseline = getattr(robot, "baseline", None)
+        get_pose = getattr(robot, "get_pose", None)
+        if baseline is None or get_pose is None:
+            return False
+        cur = get_pose()
+        diff = np.asarray(baseline[:3], float) - np.asarray(cur[:3], float)
+        if np.linalg.norm(diff) <= self.cfg.RETURN_DEADBAND_M:
+            return False
+
+        # diff is already BASE-FRAME (baseline and cur both come straight from
+        # the robot), so unlike _execute this needs NO person/base conversion
+        # -- move_relative's dx/dy/dz are base-frame by contract, and that is
+        # exactly what diff already is.
+        step = {
+            "dx": float(np.clip(diff[0] * self.cfg.RETURN_GAIN,
+                                -self.cfg.STEP_LIMIT["dx"], self.cfg.STEP_LIMIT["dx"])),
+            "dy": float(np.clip(diff[1] * self.cfg.RETURN_GAIN,
+                                -self.cfg.STEP_LIMIT["dy"], self.cfg.STEP_LIMIT["dy"])),
+            "dz": float(np.clip(diff[2] * self.cfg.RETURN_GAIN,
+                                -self.cfg.STEP_LIMIT["dz"], self.cfg.STEP_LIMIT["dz"])),
+        }
+        return bool(robot.move_relative(dx=step["dx"], dy=step["dy"], dz=step["dz"],
+                                        asynchronous=True))
+
     def _execute(self, delta: Dict[str, float], angles: PostureAngles, robot) -> bool:
-        """One smooth move to the target. Translations + tilt via move_relative;
-        rotation about vertical via adjust_rotation. Lateral and rotation take
-        their MAGNITUDE from the optimiser and their DIRECTION from the observed
-        lean/twist, so the artifact tracks toward the strained side."""
+        """
+        One SINGLE combined move to the target: translation, tilt, and
+        rotation about vertical are all folded into ONE move_relative call.
+
+        Previously this issued two sequential moves (one for
+        position+tilt via move_relative, a second for rotation via
+        adjust_rotation, which itself just calls move_relative again). Issuing
+        a second moveL before the robot has physically settled the first one
+        makes the controller replan a new trajectory mid-motion from a moving
+        pose, which is what produced visibly jerky/"distorted" combined
+        motion. Folding both into one move_relative call, in one target pose,
+        removes that entirely.
+
+        dx/dy here are computed in PERSON-RELATIVE terms ("this much toward
+        their right", "this much toward them") from the observed lean/twist
+        direction. They are converted into the robot's base frame via
+        robot.person_to_base_xy() before being sent -- previously they were
+        passed straight through as if the robot's base X/Y axes were already
+        aligned with the person, which is only true if the rig happens to be
+        mounted square to the workstation and was never actually verified.
+        This is very likely why moves looked like "the wrong direction":
+        the optimiser and sign logic below were correct in person-relative
+        terms, but execution applied those numbers to whatever the base frame
+        happened to call X and Y.
+
+        Lateral and rotation take their MAGNITUDE from the optimiser and their
+        DIRECTION from the observed lean/twist, so the artifact tracks toward
+        the strained side (see optimize_target's docstring on why the sign the
+        optimiser itself picks for these two DOF is not meaningful).
+        """
         dz = delta.get("dz", 0.0)
-        dy = delta.get("dy", 0.0)
+        dy_person = delta.get("dy", 0.0)
         dtilt = delta.get("dtilt", 0.0)
 
         # Direction from observed signed lean/twist; magnitude from the optimiser.
@@ -446,15 +527,23 @@ class GoalBasedController:
                       or np.sign(angles.neck_twist_deg)
                       or np.sign(angles.neck_sidebend_deg)
                       or 1.0)
-        dx = abs(delta.get("dx", 0.0)) * (-side_sign) * self.cfg.LATERAL_SIGN
-        drot = abs(delta.get("drot", 0.0)) * (-twist_sign) * self.cfg.LATERAL_SIGN
+        dx_person = abs(delta.get("dx", 0.0)) * (-side_sign) * self.cfg.LATERAL_SIGN
+        drot = abs(delta.get("drot", 0.0)) * (-twist_sign) * self.cfg.ROTATION_SIGN
 
-        ok = True
-        if any(abs(v) > 1e-4 for v in (dx, dy, dz, dtilt)):
-            ok = robot.move_relative(dx=dx, dy=dy, dz=dz, drx=dtilt, asynchronous=True)
-        if abs(drot) > 1e-4:
-            robot.adjust_rotation(drot)
-        return bool(ok)
+        # Convert person-relative lateral/depth into whatever the robot's own
+        # base frame actually is. Falls back to passing through unconverted
+        # if the robot doesn't expose the calibration (e.g. a minimal test
+        # double), which reproduces the old (unsafe) behaviour rather than
+        # silently swallowing the move.
+        to_base = getattr(robot, "person_to_base_xy", None)
+        dx, dy = to_base(dx_person, dy_person) if to_base else (dx_person, dy_person)
+        tilt_axis_fn = getattr(robot, "tilt_axis_base", None)
+        tilt_axis = tilt_axis_fn() if tilt_axis_fn else (1.0, 0.0, 0.0)
+
+        if not any(abs(v) > 1e-4 for v in (dx, dy, dz, dtilt, drot)):
+            return True
+        return bool(robot.move_relative(dx=dx, dy=dy, dz=dz, drx=dtilt, drz=drot,
+                                        tilt_axis=tilt_axis, asynchronous=True))
 
 
 # --------------------------------------------------------------------------
@@ -462,11 +551,35 @@ class GoalBasedController:
 # --------------------------------------------------------------------------
 
 class _FakeRobot:
-    def __init__(self):
+    """Test double exercising the same contract robot_interface implements,
+    including person-frame conversion, so the self-test below actually
+    demonstrates the frame fix rather than silently taking the pass-through
+    fallback path."""
+    def __init__(self, yaw_deg=0.0, baseline=(0.0, -0.3, 0.15, 0, 0, 0)):
         self.moves = []
-    def move_relative(self, dx=0, dy=0, dz=0, drx=0, dry=0, drz=0, asynchronous=False):
-        self.moves.append(("move_relative", dict(dx=dx, dy=dy, dz=dz, drx=drx)))
+        self.baseline = list(baseline)
+        self._pose = list(baseline)
+        self.yaw_deg = yaw_deg
+
+    def person_to_base_xy(self, dx_person, dy_person):
+        r = np.radians(self.yaw_deg)
+        c, s = np.cos(r), np.sin(r)
+        return dx_person * c - dy_person * s, dx_person * s + dy_person * c
+
+    def tilt_axis_base(self):
+        ax, ay = self.person_to_base_xy(1.0, 0.0)
+        return (ax, ay, 0.0)
+
+    def get_pose(self):
+        return np.array(self._pose, float)
+
+    def move_relative(self, dx=0, dy=0, dz=0, drx=0, dry=0, drz=0,
+                      tilt_axis=(1.0, 0.0, 0.0), asynchronous=False):
+        self.moves.append(("move_relative",
+                           dict(dx=dx, dy=dy, dz=dz, drx=drx, drz=drz)))
+        self._pose[0] += dx; self._pose[1] += dy; self._pose[2] += dz
         return True
+
     def adjust_rotation(self, d):
         self.moves.append(("adjust_rotation", d)); return True
 
@@ -520,3 +633,56 @@ if __name__ == "__main__":
     print("  robot moves recorded:", len(robot.moves))
     print("  control condition is a no-op:",
           GoalBasedController('control', pss).evaluate(comp, strained, robot, now=t)["triggered"] is False)
+
+    def _run_until_triggered(ctrl, comp, ang, robot, t, max_steps=20, dt=0.5):
+        for _ in range(max_steps):
+            r = ctrl.evaluate(comp, ang, robot, now=t)
+            t += dt
+            if r["triggered"]:
+                return r, t
+        return r, t
+
+    print("\none combined move per intervention, not two:")
+    move_kinds = [m[0] for m in robot.moves]
+    only_move_relative = all(k == "move_relative" for k in move_kinds)
+    print(f"  move kinds: {move_kinds}  (all move_relative, no separate "
+          f"adjust_rotation calls: {only_move_relative})")
+    assert only_move_relative, "rotation must be folded into the same move_relative call"
+
+    print("\nperson-frame calibration actually changes execution direction:")
+    lean_right = PostureAngles(trunk_flexion_deg=30, neck_flexion_deg=15,
+                               trunk_sidebend_deg=15,
+                               upper_arm_flexion_deg=20, lower_arm_flexion_deg=90)
+    for yaw in (0.0, 90.0):
+        robot2 = _FakeRobot(yaw_deg=yaw)
+        ctrl2 = GoalBasedController(condition="experimental", pss_calc=PSSv2Calculator())
+        _run_until_triggered(ctrl2, {"pss_smooth": 0.45}, lean_right, robot2, 200.0)
+        moves = [m for k, m in robot2.moves if k == "move_relative"]
+        last = moves[-1] if moves else {"dx": 0, "dy": 0}
+        print(f"  yaw={yaw:>5.0f} deg -> base-frame move dx={last['dx']:+.4f} "
+              f"dy={last['dy']:+.4f}")
+    print("  (same physical lean, same commanded magnitude, different base-frame")
+    print("   direction depending on rig calibration -- this is the fix: previously")
+    print("   yaw was never applied at all, so this always came out as yaw=0.)")
+
+    print("\nreturn-to-baseline drift when strain subsides (fixes 'unidirectional'):")
+    robot3 = _FakeRobot()
+    ctrl3 = GoalBasedController(condition="experimental", pss_calc=PSSv2Calculator())
+    _, t3 = _run_until_triggered(ctrl3, {"pss_smooth": 0.45}, strained, robot3, 300.0)
+    displaced = robot3.get_pose()[:3].copy()
+    print(f"  after intervention, displaced from baseline by "
+          f"{np.linalg.norm(displaced - np.array(robot3.baseline[:3])):.4f} m")
+    t3 += ControllerConfig.COOLDOWN_S + 0.1   # let cooldown elapse
+    drifted_home = False
+    for _ in range(15):
+        r = ctrl3.evaluate({"pss_smooth": 0.05}, PostureAngles(), robot3, now=t3)
+        if r["reason"] == "returning_to_baseline":
+            drifted_home = True
+        t3 += ControllerConfig.COOLDOWN_S + 0.1
+    final = robot3.get_pose()[:3].copy()
+    remaining = np.linalg.norm(final - np.array(robot3.baseline[:3]))
+    print(f"  drifted home at least once: {drifted_home}")
+    print(f"  remaining distance from baseline after 15 quiet cycles: {remaining:.4f} m")
+    assert drifted_home, "should have drifted toward baseline while strain was low"
+    assert remaining < np.linalg.norm(displaced - np.array(robot3.baseline[:3])), \
+        "should have moved closer to baseline, not stayed put or moved further"

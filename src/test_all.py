@@ -233,18 +233,97 @@ def test_drot_direction_uses_trunk_twist():
     driver of drot.
 
     Rotation is now folded into the SAME move_relative call as translation and
-    tilt, so this checks the drz field of that one call rather than a separate
+    tilt (see test_rotation_folded_into_single_move for that fix specifically),
+    so this checks the drz field of that one call rather than a separate
     adjust_rotation call."""
     from pss_v2 import PSSv2Calculator, PostureAngles
     from goal_controller import GoalBasedController, _FakeRobot
     ctrl = GoalBasedController("experimental", PSSv2Calculator())
     robot = _FakeRobot()
-    ang = PostureAngles(trunk_twist_deg=-25)
+    ang = PostureAngles(trunk_twist_deg=-25)  # neck_twist_deg, neck_sidebend_deg default to 0
     ctrl._execute({"drot": 0.2}, ang, robot)
     kind, applied = robot.moves[-1]
     assert kind == "move_relative"
     assert applied["drz"] > 0, \
         "drot sign must follow trunk_twist_deg, not fall back to a fixed default"
+
+
+@test
+def test_rotation_folded_into_single_move():
+    """REGRESSION: translation+tilt and rotation-about-vertical used to be
+    issued as two SEPARATE move_relative calls (the second via
+    adjust_rotation). Issuing a second moveL before the robot has physically
+    settled the first makes it replan mid-motion from a moving pose, which
+    produced visibly jerky/distorted combined motion. They must be one call."""
+    from pss_v2 import PSSv2Calculator, PostureAngles
+    from goal_controller import GoalBasedController, _FakeRobot
+    ctrl = GoalBasedController("experimental", PSSv2Calculator())
+    robot = _FakeRobot()
+    ang = PostureAngles(trunk_flexion_deg=40, trunk_twist_deg=-25)
+    ctrl._execute({"dz": 0.02, "dtilt": 0.05, "drot": 0.2}, ang, robot)
+    assert len(robot.moves) == 1, \
+        f"expected one combined move, got {len(robot.moves)}: {robot.moves}"
+    kind, applied = robot.moves[0]
+    assert kind == "move_relative"
+    assert abs(applied["dz"]) > 0 and abs(applied["drx"]) > 0 and abs(applied["drz"]) > 0, \
+        "translation, tilt, and rotation must all be present in the one call"
+
+
+@test
+def test_person_frame_calibration_changes_base_direction():
+    """REGRESSION: dx/dy were passed straight from person-relative sign logic
+    into the robot's base frame as if base X/Y were already aligned with the
+    person, which is only true by coincidence. A rig mounted at any other
+    angle would get lateral/depth moves in the wrong physical direction."""
+    from pss_v2 import PostureAngles
+    from goal_controller import GoalBasedController, _FakeRobot, PSSv2Calculator
+    ang = PostureAngles(trunk_flexion_deg=30, trunk_sidebend_deg=15)
+    results = {}
+    for yaw in (0.0, 90.0):
+        robot = _FakeRobot(yaw_deg=yaw)
+        ctrl = GoalBasedController("experimental", PSSv2Calculator())
+        ctrl._execute({"dx": 0.02, "dy": 0.02}, ang, robot)
+        _, applied = robot.moves[-1]
+        results[yaw] = (round(applied["dx"], 5), round(applied["dy"], 5))
+    assert results[0.0] != results[90.0], \
+        f"yaw calibration had no effect on base-frame direction: {results}"
+
+
+@test
+def test_returns_toward_baseline_when_strain_subsides():
+    """REGRESSION: the artifact only ever moved AWAY from baseline (an
+    intervention fires, then it simply stays put). Reported as
+    'unidirectional': lean once and every later move compounds in whatever
+    direction that first lean pushed, because nothing ever pulls it back."""
+    from pss_v2 import PSSv2Calculator, PostureAngles
+    from goal_controller import GoalBasedController, ControllerConfig, _FakeRobot
+    robot = _FakeRobot()
+    ctrl = GoalBasedController("experimental", PSSv2Calculator())
+    strained = PostureAngles(trunk_flexion_deg=50, neck_flexion_deg=25,
+                             upper_arm_flexion_deg=40, lower_arm_flexion_deg=85)
+    t = 0.0
+    triggered = False
+    for _ in range(20):
+        r = ctrl.evaluate({"pss_smooth": 0.45}, strained, robot, now=t)
+        t += 0.5
+        if r["triggered"]:
+            triggered = True
+            break
+    assert triggered, "setup: intervention never fired"
+    displaced = np.linalg.norm(robot.get_pose()[:3] - np.array(robot.baseline[:3]))
+    assert displaced > 0.005, "setup: intervention did not move the robot"
+
+    t += ControllerConfig.COOLDOWN_S + 0.1
+    drifted = False
+    for _ in range(15):
+        r = ctrl.evaluate({"pss_smooth": 0.05}, PostureAngles(), robot, now=t)
+        if r["reason"] == "returning_to_baseline":
+            drifted = True
+        t += ControllerConfig.COOLDOWN_S + 0.1
+    remaining = np.linalg.norm(robot.get_pose()[:3] - np.array(robot.baseline[:3]))
+    assert drifted, "never attempted to return toward baseline while strain was low"
+    assert remaining < displaced, \
+        f"should have moved closer to baseline: {displaced:.4f} -> {remaining:.4f}"
 
 
 @test

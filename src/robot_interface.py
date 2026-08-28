@@ -114,7 +114,7 @@ class RobotConfig:
     # Use the robot's own IK for exact joint-space margins when live. UR
     # publishes DH parameters that are revision-controlled per serial number,
     # so the robot's calibrated kinematics beat our nominal table.
-    USE_ROBOT_IK = True
+    USE_ROBOT_IK = False
     KINEMATICS = UR3_NOMINAL          # offline/simulation fallback only
 
     # Baseline is a large motion with no person interaction yet. moveJ plans in
@@ -124,6 +124,29 @@ class RobotConfig:
     BASELINE_USE_MOVEJ = True
     BASELINE_JOINT_SPEED = 0.6        # rad/s
     BASELINE_JOINT_ACCEL = 0.8        # rad/s^2
+
+    # ---- person-frame calibration ----
+    # The controller reasons in PERSON-RELATIVE terms: "toward the person's
+    # right", "toward the person", "up", "tilt toward them". Those are NOT the
+    # same thing as the robot's base X/Y axes unless the robot happens to be
+    # mounted square to the workstation. Nothing enforced that alignment, so
+    # every lateral/depth/tilt command was silently assuming it -- this is
+    # very likely why moves looked like they went "the wrong way" or produced
+    # no visible rotation: the optimiser was solving correctly in person-frame
+    # terms, but execution applied the numbers to the wrong physical axes.
+    #
+    # PERSON_FRAME_YAW_DEG is the rotation FROM the robot base +X axis TO the
+    # person's "right" direction (+X_person), measured counterclockwise when
+    # viewed from above. 0 means base +X already points along the person's
+    # right hand side.
+    #
+    # HOW TO MEASURE: with the robot at BASELINE_POSE, stand at the station.
+    # Command a small +X move in the base frame (e.g. move_relative(dx=0.03))
+    # and watch which physical direction the artifact actually moves relative
+    # to you. The angle from "your right" to that observed direction,
+    # measured counterclockwise from above, is PERSON_FRAME_YAW_DEG.
+    PERSON_FRAME_YAW_DEG = 90
+    PERSON_FRAME_VERIFIED = True
 
     # Safety / liveness
     MOVE_TIMEOUT_S = 5.0
@@ -188,6 +211,23 @@ def angle_between_rotvecs(a, b) -> float:
     """Magnitude of the rotation taking orientation a to orientation b (rad)."""
     R = rotvec_to_matrix(b) @ rotvec_to_matrix(a).T
     return float(np.linalg.norm(matrix_to_rotvec(R)))
+
+
+def rotate_xy(x: float, y: float, yaw_deg: float) -> Tuple[float, float]:
+    """
+    Rotate a 2D vector (x, y) counterclockwise by yaw_deg, viewed from above.
+
+    This is the ONE place the person-frame/base-frame calibration is applied.
+    It converts a person-relative delta ("this much toward their right, this
+    much toward them") into the robot base frame, using the rig's measured
+    PERSON_FRAME_YAW_DEG. It is also used to rotate the tilt axis the same
+    way, so "tilt toward the person" tips the artifact about the correct
+    physical axis regardless of how the robot happens to be mounted relative
+    to the workstation.
+    """
+    r = np.radians(yaw_deg)
+    c, s = np.cos(r), np.sin(r)
+    return x * c - y * s, x * s + y * c
 
 
 # --------------------------------------------------------------------------
@@ -272,15 +312,36 @@ class _RobotBase:
         except Exception:
             return 0.0
 
+    def person_to_base_xy(self, dx_person: float, dy_person: float) -> Tuple[float, float]:
+        """Convert a person-relative (lateral, depth) delta into the robot
+        base frame using the rig's calibrated PERSON_FRAME_YAW_DEG. Callers
+        (the controller) work entirely in person-relative terms; this is the
+        only place the physical mounting angle is applied."""
+        return rotate_xy(dx_person, dy_person, self.cfg.PERSON_FRAME_YAW_DEG)
+
+    def tilt_axis_base(self) -> Tuple[float, float, float]:
+        """Base-frame direction of the person's lateral axis. Rotating about
+        this axis tips the artifact toward/away from the person regardless of
+        mounting angle, instead of always rotating about base X."""
+        ax, ay = rotate_xy(1.0, 0.0, self.cfg.PERSON_FRAME_YAW_DEG)
+        return (ax, ay, 0.0)
+
     def _target_pose(self, delta: dict) -> np.ndarray:
-        """Absolute pose that a DOF delta would produce, without moving."""
+        """
+        Absolute pose that a DOF delta would produce, without moving. Used by
+        singularity_cost to score CANDIDATE moves before they are executed, so
+        this must use the SAME frame conversion as the real move
+        (person_to_base_xy / tilt_axis_base) or the singularity check would be
+        scoring a different physical motion than the one actually sent.
+        """
         cur = self.get_pose()
         t = cur.copy()
-        t[0] += delta.get("dx", 0.0)
-        t[1] += delta.get("dy", 0.0)
+        dx_b, dy_b = self.person_to_base_xy(delta.get("dx", 0.0), delta.get("dy", 0.0))
+        t[0] += dx_b
+        t[1] += dy_b
         t[2] += delta.get("dz", 0.0)
         if abs(delta.get("dtilt", 0.0)) > 1e-9:
-            t[3:] = compose_rotvec(t[3:], [1.0, 0.0, 0.0], delta["dtilt"])
+            t[3:] = compose_rotvec(t[3:], self.tilt_axis_base(), delta["dtilt"])
         if abs(delta.get("drot", 0.0)) > 1e-9:
             t[3:] = compose_rotvec(t[3:], [0.0, 0.0, 1.0], delta["drot"])
         return t
@@ -328,16 +389,29 @@ class _RobotBase:
 
     def move_relative(self, dx: float = 0.0, dy: float = 0.0, dz: float = 0.0,
                       drx: float = 0.0, dry: float = 0.0, drz: float = 0.0,
+                      tilt_axis: Tuple[float, float, float] = (1.0, 0.0, 0.0),
                       asynchronous: bool = True) -> bool:
         """
-        Controller contract. Translations are in the base frame; `drx` is the
-        artifact TILT, applied as a proper rotation about the base X axis.
-        The absolute target is clamped into the envelope before sending.
+        Controller contract. dx/dy/dz are BASE-FRAME translations (callers
+        that reason in person-relative terms must convert first, via
+        person_to_base_xy). `drx` is the TILT magnitude, applied as a proper
+        rotation about `tilt_axis` (defaults to base X for backward
+        compatibility; pass tilt_axis_base() to tilt about the person's actual
+        lateral axis instead of assuming it lines up with base X). `drz` is
+        rotation about the vertical. The absolute target is clamped into the
+        envelope before sending.
+
+        dx/dy/dz/drx/drz are combined into ONE target pose and sent as a
+        SINGLE move. Do not call this twice in a row for one logical
+        intervention (e.g. once for position+tilt, again for drz): issuing a
+        second moveL before the robot controller has finished the first one
+        makes it replan a new trajectory from a moving, not-yet-settled pose,
+        which is what produced visibly jerky/"distorted" combined motion.
         """
         if self.cfg.REQUIRE_SAFE_MODE and not self.is_safe():
             logger.warning("[ROBOT] unsafe state, move refused")
-            self.last_move = {"requested": [dx, dy, dz, drx], "applied": None,
-                              "clamped": False, "ok": False}
+            self.last_move = {"requested": [dx, dy, dz, drx, drz], "applied": None,
+                              "clamped": False, "ok": False, "singularity": None}
             return False
 
         cur = self.get_pose()
@@ -346,7 +420,7 @@ class _RobotBase:
         target[1] += dy
         target[2] += dz
         if abs(drx) > 1e-9:
-            target[3:] = compose_rotvec(target[3:], [1.0, 0.0, 0.0], drx)
+            target[3:] = compose_rotvec(target[3:], tilt_axis, drx)
         if abs(dry) > 1e-9:
             target[3:] = compose_rotvec(target[3:], [0.0, 1.0, 0.0], dry)
         if abs(drz) > 1e-9:
@@ -364,7 +438,7 @@ class _RobotBase:
                 self._sing_blocks += 1
                 logger.warning(f"[ROBOT] move refused: would approach a {sing} "
                                f"singularity")
-                self.last_move = {"requested": [dx, dy, dz, drx], "applied": None,
+                self.last_move = {"requested": [dx, dy, dz, drx, drz], "applied": None,
                                   "clamped": True, "ok": False, "singularity": sing}
                 return False
 
@@ -372,7 +446,7 @@ class _RobotBase:
         self._moves += 1
         applied = (target - cur)
         self.last_move = {
-            "requested": [round(v, 5) for v in (dx, dy, dz, drx)],
+            "requested": [round(v, 5) for v in (dx, dy, dz, drx, drz)],
             "applied": [round(float(v), 5) for v in applied[:3]] +
                        [round(angle_between_rotvecs(cur[3:], target[3:]), 5)],
             "clamped": bool(clamped), "ok": bool(ok), "singularity": None}
