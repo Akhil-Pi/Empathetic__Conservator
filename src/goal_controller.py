@@ -511,10 +511,20 @@ class GoalBasedController:
 
         # Direction from observed signed lean/twist; magnitude from the policy.
         side_sign = np.sign(angles.trunk_sidebend_deg) or 1.0
-        twist_sign = (np.sign(angles.trunk_twist_deg)
-                      or np.sign(angles.neck_twist_deg)
-                      or np.sign(angles.neck_sidebend_deg)
+        # HEAD_GAZE_ROTATION drot only ever comes from a head/gaze trigger, so
+        # the sign must track actual head turn: neck_twist_deg first. NOT
+        # lateral_gaze_deg/neck_sidebend_deg -- both are structurally almost
+        # always positive (measured bias, confirmed across sessions: they
+        # share the same underlying formula and rarely if ever go negative),
+        # so putting either first locks the sign to +1 for an entire session
+        # regardless of which way the head actually turns. trunk_twist_deg is
+        # torso-vs-hip rotation, a different physical quantity that can sit
+        # at a small nonzero value (postural sway, noise) independent of head
+        # direction, so it comes after neck_twist_deg, not before it.
+        twist_sign = (np.sign(angles.neck_twist_deg)
+                      or np.sign(angles.trunk_twist_deg)
                       or np.sign(angles.lateral_gaze_deg)
+                      or np.sign(angles.neck_sidebend_deg)
                       or 1.0)
         dx = abs(delta.get("dx", 0.0)) * (-side_sign) * self.cfg.LATERAL_SIGN
         drot = abs(delta.get("drot", 0.0)) * (-twist_sign) * self.cfg.LATERAL_SIGN
