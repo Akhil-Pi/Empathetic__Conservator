@@ -212,9 +212,18 @@ class _RobotBase:
         self.cfg = cfg
         self.baseline = np.asarray(cfg.BASELINE_POSE, float).copy()
         # Populated after each move so the session loop can log what really
-        # happened rather than what was requested.
+        # happened rather than what was requested. last_move is the
+        # translation/tilt half (move_relative); last_rotation is the
+        # rotation half (adjust_rotation). Kept separate so a combined
+        # twist+lean intervention -- two independent robot calls -- doesn't
+        # have the second call's outcome silently overwrite the first's in
+        # the log (confirmed live: a singularity refusal on the raise half
+        # made it impossible to tell whether the rotation half had already
+        # succeeded).
         self.last_move = {"requested": None, "applied": None,
                           "clamped": False, "ok": False, "singularity": None}
+        self.last_rotation = {"requested": None, "applied": None,
+                              "clamped": False, "ok": False, "singularity": None}
         self._moves = 0
         self._sing_blocks = 0
         self._rotation_accum_rad = 0.0     # cumulative J6 rotation since baseline
@@ -488,11 +497,13 @@ class UR3Robot(_RobotBase):
         satisfy "keep TCP position fixed" however it likes, and nothing
         pins the motion to a clean, predictable spin. J6 has no such
         ambiguity. Cumulative rotation since baseline is capped at
-        cfg.MAX_ROT_RAD, mirroring the base class's orientation clamp."""
+        cfg.MAX_ROT_RAD, mirroring the base class's orientation clamp.
+        Writes self.last_rotation, NOT self.last_move -- see the note on
+        last_rotation in __init__ for why the two must stay separate."""
         if self.cfg.REQUIRE_SAFE_MODE and not self.is_safe():
             logger.warning("[ROBOT] unsafe state, rotation refused")
-            self.last_move = {"requested": [0.0, 0.0, 0.0, drot], "applied": None,
-                              "clamped": False, "ok": False, "singularity": None}
+            self.last_rotation = {"requested": [0.0, 0.0, 0.0, drot], "applied": None,
+                                  "clamped": False, "ok": False, "singularity": None}
             return False
 
         new_accum = self._rotation_accum_rad + drot
@@ -506,8 +517,8 @@ class UR3Robot(_RobotBase):
             q = list(map(float, self.rtde_r.getActualQ()))
         except Exception as e:
             logger.error(f"[ROBOT] could not read joints for rotation: {e}")
-            self.last_move = {"requested": [0.0, 0.0, 0.0, drot], "applied": None,
-                              "clamped": clamped, "ok": False, "singularity": None}
+            self.last_rotation = {"requested": [0.0, 0.0, 0.0, drot], "applied": None,
+                                  "clamped": clamped, "ok": False, "singularity": None}
             return False
         q[5] += drot
 
@@ -520,9 +531,9 @@ class UR3Robot(_RobotBase):
 
         if ok:
             self._rotation_accum_rad = new_accum
-        self.last_move = {"requested": [0.0, 0.0, 0.0, drot],
-                          "applied": [0.0, 0.0, 0.0, drot] if ok else None,
-                          "clamped": clamped, "ok": ok, "singularity": None}
+        self.last_rotation = {"requested": [0.0, 0.0, 0.0, drot],
+                              "applied": [0.0, 0.0, 0.0, drot] if ok else None,
+                              "clamped": clamped, "ok": ok, "singularity": None}
         if clamped:
             logger.info("[ROBOT] rotation clamped by MAX_ROT_RAD cumulative budget")
         return ok

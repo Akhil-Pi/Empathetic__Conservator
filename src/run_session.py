@@ -196,6 +196,7 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
             result = ctrl.evaluate(comp, pss.calibrated_angles(angles), robot)
             if result.get("triggered"):
                 lm = getattr(robot, "last_move", {}) or {}
+                lr = getattr(robot, "last_rotation", {}) or {}
                 command = result.get("command_delta", {}) or {}
                 diag_angles = result.get("diagnostic_angles", {}) or {}
                 log.log_event("intervention", comp["pss_smooth"], result=result,
@@ -203,6 +204,10 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
                                       f"applied={lm.get('applied')} "
                                       f"ok={lm.get('ok')} "
                                       f"singularity={lm.get('singularity')} "
+                                      f"rot_applied={lr.get('applied')} "
+                                      f"rot_ok={lr.get('ok')} "
+                                      f"rot_clamped={lr.get('clamped')} "
+                                      f"rot_singularity={lr.get('singularity')} "
                                       f"policy={result.get('policy')} "
                                       f"command={command} "
                                       f"angles={diag_angles}")

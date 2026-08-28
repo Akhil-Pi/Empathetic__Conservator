@@ -155,6 +155,11 @@ class ControllerConfig:
     # fixture slowly. These thresholds are intentionally simple so the live test
     # can validate signs before returning to a more ambitious optimiser.
     HEAD_TURN_TRIGGER_DEG = 8.0
+    # Below this, neck_twist_deg is treated as noise and neck_sidebend_deg is
+    # trusted instead for BOTH sign and magnitude (see _head_turn_signal).
+    # Deliberately smaller than HEAD_TURN_TRIGGER_DEG: this only decides
+    # which signal to believe, not whether to act on it.
+    HEAD_TWIST_NOISE_FLOOR_DEG = 2.0
     HEAD_TURN_SATURATION_DEG = 30.0
     FORWARD_LEAN_TRIGGER_DEG = 15.0
     FORWARD_LEAN_SATURATION_DEG = 45.0
@@ -489,6 +494,21 @@ class GoalBasedController:
         lean, while neck_twist_deg stayed small and correctly signed) --
         letting the larger value win would have handed the sign to that
         inflated, still-not-fully-trusted signal on every leaning episode.
+
+        The selection cutoff is HEAD_TWIST_NOISE_FLOOR_DEG, NOT
+        HEAD_TURN_TRIGGER_DEG: this decides which SIGNAL to trust, not
+        whether it is big enough to act on (callers compare the returned
+        value against HEAD_TURN_TRIGGER_DEG separately for that). Using the
+        trigger threshold here was tried and confirmed broken live (DEBUG17
+        event 7): neck_twist_deg=-5.57 is a small but real, correctly-signed
+        twist, yet it fell below the 8 deg trigger and handed BOTH the
+        magnitude and the sign to neck_sidebend_deg=+14.12 -- direction and
+        size ended up sourced from two different physical signals that
+        disagreed. neck_twist_deg is essentially never exactly 0 in live
+        data (confirmed: 0 percent of frames in a real session), so a
+        strict "nonzero" gate would starve out neck_sidebend_deg from ever
+        being selected; the small noise-floor threshold is a middle ground.
+
         lateral_gaze_deg is not used because it is defined to equal
         neck_sidebend_deg (see pose_fusion.fuse); trunk_twist_deg is not used
         because it measures the TORSO against the hips, a different physical
@@ -496,7 +516,7 @@ class GoalBasedController:
         _rule_target (trigger + magnitude) and _execution_delta (sign) so the
         two can't disagree about which axis is driving the move."""
         twist = angles.neck_twist_deg
-        return twist if abs(twist) >= cfg.HEAD_TURN_TRIGGER_DEG else angles.neck_sidebend_deg
+        return twist if abs(twist) >= cfg.HEAD_TWIST_NOISE_FLOOR_DEG else angles.neck_sidebend_deg
 
     def _rule_target(self, angles: PostureAngles, pss_components: dict,
                      cfg=ControllerConfig) -> Dict[str, float]:
@@ -536,11 +556,23 @@ class GoalBasedController:
         dx = command["dx"]
         drot = command["drot"]
 
+        rotated = abs(drot) > 1e-4
+        moved_linear = any(abs(v) > 1e-4 for v in (dx, dy, dz, dtilt))
         ok = True
-        if abs(drot) > 1e-4:
+        if rotated:
             ok = robot.adjust_rotation(drot) and ok
-        if any(abs(v) > 1e-4 for v in (dx, dy, dz, dtilt)):
+        if moved_linear:
             ok = robot.move_relative(dx=dx, dy=dy, dz=dz, drx=dtilt, asynchronous=True) and ok
+        if not rotated and not moved_linear:
+            # Neither sub-move cleared the 1e-4 threshold, so robot.last_move
+            # is never touched this cycle -- without this, the event log
+            # would show whatever last_move was left over from a PREVIOUS,
+            # unrelated intervention, misleadingly implying this cycle also
+            # moved something (confirmed live, DEBUG17 event 9: applied was
+            # a byte-for-byte copy of event 8's).
+            robot.last_move = {"requested": [0.0, 0.0, 0.0, 0.0],
+                               "applied": [0.0, 0.0, 0.0, 0.0],
+                               "clamped": False, "ok": True, "singularity": None}
         return bool(ok)
 
     def _execution_delta(self, delta: Dict[str, float], angles: PostureAngles) -> Dict[str, float]:
@@ -551,18 +583,16 @@ class GoalBasedController:
 
         # Direction from observed signed lean/twist; magnitude from the policy.
         side_sign = np.sign(angles.trunk_sidebend_deg) or 1.0
-        # Unlike _head_turn_signal's magnitude decision (which requires
-        # neck_twist_deg to clear HEAD_TURN_TRIGGER_DEG before trusting it,
-        # so tiny noise can't fire a whole new intervention), the SIGN of an
-        # already-decided nonzero drot should trust any real, nonzero
-        # neck_twist_deg reading regardless of size -- a small twist still
-        # has a genuine direction, and falling back to neck_sidebend_deg
-        # (still not always reliable, see _head_turn_signal) just because
-        # the twist happened to be small would throw that direction away.
-        # See _head_turn_signal for why not trunk_twist_deg/lateral_gaze_deg.
-        twist_sign = (np.sign(angles.neck_twist_deg)
-                      or np.sign(angles.neck_sidebend_deg)
-                      or 1.0)
+        # MUST be the sign of the exact same value _rule_target used for
+        # magnitude (_head_turn_signal), not an independently-chosen field.
+        # An earlier version used neck_twist_deg's own sign whenever it was
+        # nonzero (even below HEAD_TURN_TRIGGER_DEG) while the magnitude
+        # still came from neck_sidebend_deg once twist fell below the
+        # trigger -- when the two disagreed in sign (confirmed live,
+        # DEBUG17 event 7: neck_twist_deg=-5.57 but neck_sidebend_deg=+14.12
+        # supplied the magnitude), the rotation direction and size were
+        # silently sourced from two different physical signals.
+        twist_sign = np.sign(self._head_turn_signal(angles, self.cfg)) or 1.0
         dx = abs(delta.get("dx", 0.0)) * (-side_sign) * self.cfg.LATERAL_SIGN
         drot = abs(delta.get("drot", 0.0)) * (-twist_sign) * self.cfg.LATERAL_SIGN
         return {"dx": float(dx), "dy": float(dy), "dz": float(dz),
