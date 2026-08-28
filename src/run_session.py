@@ -200,6 +200,7 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
                 log.log_event("intervention", comp["pss_smooth"], result=result,
                               details=f"clamped={lm.get('clamped')} "
                                       f"applied={lm.get('applied')} "
+                                      f"ok={lm.get('ok')} "
                                       f"singularity={lm.get('singularity')} "
                                       f"policy={result.get('policy')} "
                                       f"command={command}")

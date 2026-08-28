@@ -491,7 +491,7 @@ class GoalBasedController:
         if any(abs(v) > 1e-4 for v in (dx, dy, dz, dtilt)):
             ok = robot.move_relative(dx=dx, dy=dy, dz=dz, drx=dtilt, asynchronous=True)
         if abs(drot) > 1e-4:
-            robot.adjust_rotation(drot)
+            ok = robot.adjust_rotation(drot) and ok
         return bool(ok)
 
     def _execution_delta(self, delta: Dict[str, float], angles: PostureAngles) -> Dict[str, float]:
