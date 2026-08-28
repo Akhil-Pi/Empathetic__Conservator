@@ -460,19 +460,27 @@ class GoalBasedController:
 
     def _rule_target(self, angles: PostureAngles, pss_components: dict,
                      cfg=ControllerConfig) -> Dict[str, float]:
-        """Simple rig-test policy: head/gaze -> rotate, forward lean -> raise."""
+        """Simple rig-test policy: head/gaze -> rotate, forward lean -> raise,
+        independently -- both fire in the same call when both are present
+        (twisted AND leaning), so the artifact rotates AND keeps raising for
+        as long as the lean stays above FORWARD_LEAN_TRIGGER_DEG. _execute()
+        sequences rotation before the raise on a combined move."""
         delta = {d: 0.0 for d in cfg.DOF}
 
+        # neck_twist_deg first: lateral_gaze_deg/neck_sidebend_deg are
+        # structurally almost always positive (measured fusion bias) and
+        # correlate with forward flexion, so leaning alone can push gaze past
+        # HEAD_TURN_TRIGGER_DEG with no real head turn. Using it as primary
+        # would fire a rotation on every lean-only episode.
         head_signal = (
-            angles.lateral_gaze_deg
-            if abs(angles.lateral_gaze_deg) >= cfg.HEAD_TURN_TRIGGER_DEG
-            else angles.neck_twist_deg
+            angles.neck_twist_deg
+            if abs(angles.neck_twist_deg) >= cfg.HEAD_TURN_TRIGGER_DEG
+            else angles.lateral_gaze_deg
         )
         if abs(head_signal) >= cfg.HEAD_TURN_TRIGGER_DEG and "drot" in self.dof:
             scale = min(abs(head_signal) / cfg.HEAD_TURN_SATURATION_DEG, 1.0)
             delta["drot"] = min(cfg.HEAD_ROT_STEP_RAD * scale,
                                  cfg.STEP_LIMIT["drot"])
-            return delta
 
         trunk_flex = pss_components.get("trunk_flexion_deg", angles.trunk_flexion_deg)
         neck_flex = pss_components.get("neck_flexion_deg", angles.neck_flexion_deg)
@@ -485,10 +493,10 @@ class GoalBasedController:
         return delta
 
     def _execute(self, delta: Dict[str, float], angles: PostureAngles, robot) -> bool:
-        """One smooth move to the target. Translations + tilt via move_relative;
-        rotation about vertical via adjust_rotation. Lateral and rotation take
-        their MAGNITUDE from the optimiser and their DIRECTION from the observed
-        lean/twist, so the artifact tracks toward the strained side."""
+        """One smooth move to the target. Rotation about vertical via
+        adjust_rotation happens FIRST, then translation + tilt via
+        move_relative -- on a combined twist+lean trigger the artifact
+        rotates to the head-turn direction before it starts raising."""
         command = self._execution_delta(delta, angles)
         dz = command["dz"]
         dy = command["dy"]
@@ -497,10 +505,10 @@ class GoalBasedController:
         drot = command["drot"]
 
         ok = True
-        if any(abs(v) > 1e-4 for v in (dx, dy, dz, dtilt)):
-            ok = robot.move_relative(dx=dx, dy=dy, dz=dz, drx=dtilt, asynchronous=True)
         if abs(drot) > 1e-4:
             ok = robot.adjust_rotation(drot) and ok
+        if any(abs(v) > 1e-4 for v in (dx, dy, dz, dtilt)):
+            ok = robot.move_relative(dx=dx, dy=dy, dz=dz, drx=dtilt, asynchronous=True) and ok
         return bool(ok)
 
     def _execution_delta(self, delta: Dict[str, float], angles: PostureAngles) -> Dict[str, float]:
