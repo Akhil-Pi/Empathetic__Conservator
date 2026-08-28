@@ -213,6 +213,18 @@ class PSSv2Calculator:
             "neck_flexion_deg": 0.0,
             "upper_arm_flexion_deg": 0.0,
             "lower_arm_flexion_deg": 0.0,
+            # Lateral/twist are signed about an anatomical zero, same as the
+            # flexion angles above, but were previously passed straight
+            # through uncalibrated. A front-camera mounting bias then sits in
+            # the raw reading for the whole session and can keep the sign from
+            # ever crossing zero on the anatomically opposite side (observed:
+            # trunk_sidebend_deg never went negative and neck_sidebend_deg
+            # never dropped below ~27 deg across a session that included a
+            # left side-bend hold).
+            "trunk_sidebend_deg": 0.0,
+            "neck_sidebend_deg": 0.0,
+            "trunk_twist_deg": 0.0,
+            "neck_twist_deg": 0.0,
         }
         self._calibrated = False
         self._static_load_since: Optional[float] = None
@@ -244,10 +256,10 @@ class PSSv2Calculator:
             neck_flexion_deg=a.neck_flexion_deg - self._neutral["neck_flexion_deg"],
             upper_arm_flexion_deg=a.upper_arm_flexion_deg - self._neutral["upper_arm_flexion_deg"],
             lower_arm_flexion_deg=a.lower_arm_flexion_deg - self._neutral["lower_arm_flexion_deg"],
-            trunk_sidebend_deg=a.trunk_sidebend_deg,
-            trunk_twist_deg=a.trunk_twist_deg,
-            neck_sidebend_deg=a.neck_sidebend_deg,
-            neck_twist_deg=a.neck_twist_deg,
+            trunk_sidebend_deg=a.trunk_sidebend_deg - self._neutral["trunk_sidebend_deg"],
+            trunk_twist_deg=a.trunk_twist_deg - self._neutral["trunk_twist_deg"],
+            neck_sidebend_deg=a.neck_sidebend_deg - self._neutral["neck_sidebend_deg"],
+            neck_twist_deg=a.neck_twist_deg - self._neutral["neck_twist_deg"],
             lateral_gaze_deg=a.lateral_gaze_deg,
             confidence=a.confidence,
         )
