@@ -139,10 +139,23 @@ def frontal_deviation(vec: np.ndarray, cfg=FusionConfig) -> float:
     SIGNED: the sign follows the lateral axis, so the controller can tell which
     way the person is leaning and shift the artifact to counter it. PSS_v2 takes
     the magnitude internally, so signed input does not affect scoring.
+
+    The reference "vertical" length is the vector's projection onto the
+    sagittal-vertical plane (up and forward/back), NOT just its raw up
+    component. A segment (shoulder-hip, ear-shoulder) keeps roughly the same
+    length in that plane whether the person bends forward or stands upright;
+    only its split between up and forward changes. Dividing by the raw up
+    component alone shrinks the denominator as someone leans forward, which
+    inflates ANY nonzero lateral component into a large angle even with no
+    real side-bend -- confirmed with a synthetic pose held at a constant 15
+    deg true side-bend: the old formula reported 15.0 deg at trunk_deg=0 but
+    57.1 deg at trunk_deg=80, purely from forward lean.
     """
-    up = abs(vec[cfg.WORLD_UP_AXIS])
+    up = vec[cfg.WORLD_UP_AXIS]
+    fwd = vec[cfg.WORLD_FWD_AXIS]
     lat = vec[cfg.WORLD_LAT_AXIS]
-    return float(np.degrees(np.arctan2(lat, up))) if up != 0 or lat != 0 else 0.0
+    vertical_ref = float(np.hypot(up, fwd))
+    return float(np.degrees(np.arctan2(lat, vertical_ref))) if vertical_ref != 0 or lat != 0 else 0.0
 
 
 def transverse_twist(upper_vec: np.ndarray, lower_vec: np.ndarray, cfg=FusionConfig) -> float:
@@ -261,12 +274,12 @@ def fuse(side_world: Optional[dict], front_world: Optional[dict],
         shoulder_line = _xyz(front_world, "RIGHT_SHOULDER") - _xyz(front_world, "LEFT_SHOULDER")
         neck_twist = transverse_twist(ear_line, shoulder_line, cfg)
         conf["neck_twist_deg"] = neck_side_conf
-        # gaze continuity: signed lateral ear-midpoint offset from shoulder midpoint
-        ear_mid = _midpoint(front_world, "LEFT_EAR", "RIGHT_EAR")
-        sh_mid = _midpoint(front_world, "LEFT_SHOULDER", "RIGHT_SHOULDER")
-        gaze_deg = float(np.degrees(np.arctan2(
-            (ear_mid[cfg.WORLD_LAT_AXIS] - sh_mid[cfg.WORLD_LAT_AXIS]),
-            abs((ear_mid[cfg.WORLD_UP_AXIS] - sh_mid[cfg.WORLD_UP_AXIS])) + 1e-6)))
+        # gaze continuity (legacy field, not scored): ear-midpoint deviation
+        # from shoulder-midpoint is the same "_neck_vec through vertical"
+        # geometry as neck_sidebend_deg above, so reuse that value directly
+        # instead of re-deriving it with a near-duplicate formula that could
+        # drift out of sync.
+        gaze_deg = neck_side
         conf["lateral_gaze_deg"] = neck_side_conf
 
     # ---- arm (prefer side; near arm is well seen from the side) ----

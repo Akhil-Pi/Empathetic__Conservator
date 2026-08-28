@@ -362,6 +362,22 @@ class GoalBasedController:
             result["reason"] = "control_group"
             return result
 
+        # HEAD_GAZE_ROTATION's own triggers, independent of the RULA-derived
+        # PSS score: pure isolated neck twist/side-bend caps out around
+        # pss_smooth=0.14 even at an extreme 30 deg (RULA treats it as a
+        # minor +1 adder, not a primary risk driver), which never reaches
+        # THRESHOLD=0.25. Gating this rig-test policy on PSS alone means
+        # standing straight and turning/tilting the head, with no lean, can
+        # never trigger a rotation at all. Trust the same signals
+        # _rule_target uses to decide whether to move.
+        head_signal = self._head_turn_signal(angles, self.cfg)
+        trunk_flex = pss_components.get("trunk_flexion_deg", angles.trunk_flexion_deg)
+        neck_flex = pss_components.get("neck_flexion_deg", angles.neck_flexion_deg)
+        forward_signal = max(float(trunk_flex), float(neck_flex))
+        rule_signal_active = (abs(head_signal) >= self.cfg.HEAD_TURN_TRIGGER_DEG
+                              or forward_signal >= self.cfg.FORWARD_LEAN_TRIGGER_DEG)
+        above_threshold = pss >= self.cfg.THRESHOLD or rule_signal_active
+
         # Hysteresis recovery.
         if self._in_corrected and pss < (self.cfg.THRESHOLD - self.cfg.HYSTERESIS):
             self._in_corrected = False
@@ -377,7 +393,7 @@ class GoalBasedController:
         # episode (see EPISODE_DECAY) -- the strain that started it is gone, so
         # a future trigger is a fresh problem, not a continuation, and should
         # get a full-size step again rather than an ever-shrinking leftover.
-        if pss < self.cfg.THRESHOLD:
+        if not above_threshold:
             self._above_since = None
             self._episode_fires = 0
             result["reason"] = "below_threshold"
@@ -458,25 +474,41 @@ class GoalBasedController:
                     f"(cost {cost_before:.3f}->{cost_after:.3f})")
         return result
 
+    @staticmethod
+    def _head_turn_signal(angles: PostureAngles,
+                          cfg=ControllerConfig) -> float:
+        """Signed degrees driving head-turn rotation: neck_twist_deg (actual
+        head twist relative to shoulders) when it is big enough to be a
+        deliberate motion, else neck_sidebend_deg (actual head tilt), so
+        either twisting OR tilting the neck while standing straight can drive
+        rotation. neck_twist_deg is checked first, NOT "whichever is bigger":
+        neck_sidebend_deg was, until the pose_fusion.py fix that decoupled
+        side-bend from forward lean, structurally inflated during any
+        simultaneous forward lean (confirmed on live data: it tracked
+        trunk_flexion_deg almost 1:1, e.g. 14-42 deg opposite a 38-73 deg
+        lean, while neck_twist_deg stayed small and correctly signed) --
+        letting the larger value win would have handed the sign to that
+        inflated, still-not-fully-trusted signal on every leaning episode.
+        lateral_gaze_deg is not used because it is defined to equal
+        neck_sidebend_deg (see pose_fusion.fuse); trunk_twist_deg is not used
+        because it measures the TORSO against the hips, a different physical
+        quantity that stays nonzero independent of head direction. Shared by
+        _rule_target (trigger + magnitude) and _execution_delta (sign) so the
+        two can't disagree about which axis is driving the move."""
+        twist = angles.neck_twist_deg
+        return twist if abs(twist) >= cfg.HEAD_TURN_TRIGGER_DEG else angles.neck_sidebend_deg
+
     def _rule_target(self, angles: PostureAngles, pss_components: dict,
                      cfg=ControllerConfig) -> Dict[str, float]:
-        """Simple rig-test policy: head/gaze -> rotate, forward lean -> raise,
-        independently -- both fire in the same call when both are present
-        (twisted AND leaning), so the artifact rotates AND keeps raising for
-        as long as the lean stays above FORWARD_LEAN_TRIGGER_DEG. _execute()
-        sequences rotation before the raise on a combined move."""
+        """Simple rig-test policy: head twist/side-bend -> rotate, forward
+        lean -> raise, independently -- both fire in the same call when both
+        are present (twisted/tilted AND leaning), so the artifact rotates AND
+        keeps raising for as long as the lean stays above
+        FORWARD_LEAN_TRIGGER_DEG. _execute() sequences rotation before the
+        raise on a combined move."""
         delta = {d: 0.0 for d in cfg.DOF}
 
-        # neck_twist_deg first: lateral_gaze_deg/neck_sidebend_deg are
-        # structurally almost always positive (measured fusion bias) and
-        # correlate with forward flexion, so leaning alone can push gaze past
-        # HEAD_TURN_TRIGGER_DEG with no real head turn. Using it as primary
-        # would fire a rotation on every lean-only episode.
-        head_signal = (
-            angles.neck_twist_deg
-            if abs(angles.neck_twist_deg) >= cfg.HEAD_TURN_TRIGGER_DEG
-            else angles.lateral_gaze_deg
-        )
+        head_signal = self._head_turn_signal(angles, cfg)
         if abs(head_signal) >= cfg.HEAD_TURN_TRIGGER_DEG and "drot" in self.dof:
             scale = min(abs(head_signal) / cfg.HEAD_TURN_SATURATION_DEG, 1.0)
             delta["drot"] = min(cfg.HEAD_ROT_STEP_RAD * scale,
@@ -519,19 +551,16 @@ class GoalBasedController:
 
         # Direction from observed signed lean/twist; magnitude from the policy.
         side_sign = np.sign(angles.trunk_sidebend_deg) or 1.0
-        # HEAD_GAZE_ROTATION drot only ever comes from a head/gaze trigger, so
-        # the sign must track actual head turn: neck_twist_deg first. NOT
-        # lateral_gaze_deg/neck_sidebend_deg -- both are structurally almost
-        # always positive (measured bias, confirmed across sessions: they
-        # share the same underlying formula and rarely if ever go negative),
-        # so putting either first locks the sign to +1 for an entire session
-        # regardless of which way the head actually turns. trunk_twist_deg is
-        # torso-vs-hip rotation, a different physical quantity that can sit
-        # at a small nonzero value (postural sway, noise) independent of head
-        # direction, so it comes after neck_twist_deg, not before it.
+        # Unlike _head_turn_signal's magnitude decision (which requires
+        # neck_twist_deg to clear HEAD_TURN_TRIGGER_DEG before trusting it,
+        # so tiny noise can't fire a whole new intervention), the SIGN of an
+        # already-decided nonzero drot should trust any real, nonzero
+        # neck_twist_deg reading regardless of size -- a small twist still
+        # has a genuine direction, and falling back to neck_sidebend_deg
+        # (still not always reliable, see _head_turn_signal) just because
+        # the twist happened to be small would throw that direction away.
+        # See _head_turn_signal for why not trunk_twist_deg/lateral_gaze_deg.
         twist_sign = (np.sign(angles.neck_twist_deg)
-                      or np.sign(angles.trunk_twist_deg)
-                      or np.sign(angles.lateral_gaze_deg)
                       or np.sign(angles.neck_sidebend_deg)
                       or 1.0)
         dx = abs(delta.get("dx", 0.0)) * (-side_sign) * self.cfg.LATERAL_SIGN
