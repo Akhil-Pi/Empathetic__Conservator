@@ -190,7 +190,10 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
                           skew_ms=abs(s_ts - f_ts) * 1000.0)
             frames += 1
 
-            result = ctrl.evaluate(comp, angles, robot)
+            # The controller derives motion DIRECTION from angle sign, so it
+            # must see the same neutral-corrected angles that drive the PSS
+            # score, not the raw fuse() output.
+            result = ctrl.evaluate(comp, pss.calibrated_angles(angles), robot)
             if result.get("triggered"):
                 lm = getattr(robot, "last_move", {}) or {}
                 command = result.get("command_delta", {}) or {}

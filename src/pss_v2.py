@@ -250,6 +250,14 @@ class PSSv2Calculator:
         self._neutral["lower_arm_flexion_deg"] -= 90.0
         self._calibrated = True
 
+    def calibrated_angles(self, a: PostureAngles) -> PostureAngles:
+        """Public accessor for the neutral-corrected angles. compute() applies
+        this internally for scoring, but callers that need corrected SIGNS
+        (e.g. the controller's direction logic) rather than just the PSS
+        score must call this directly on the same raw `angles` they got from
+        fuse()."""
+        return self._apply_neutral(a) if self._calibrated else a
+
     def _apply_neutral(self, a: PostureAngles) -> PostureAngles:
         return PostureAngles(
             trunk_flexion_deg=a.trunk_flexion_deg - self._neutral["trunk_flexion_deg"],
