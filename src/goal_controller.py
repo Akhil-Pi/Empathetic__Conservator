@@ -647,13 +647,22 @@ class GoalBasedController:
         for _, fn in steps:
             ok = fn() and ok
 
-        if not rotated and not moved_linear:
-            # Neither sub-move cleared the 1e-4 threshold, so robot.last_move
-            # is never touched this cycle -- without this, the event log
-            # would show whatever last_move was left over from a PREVIOUS,
-            # unrelated intervention, misleadingly implying this cycle also
-            # moved something (confirmed live, DEBUG17 event 9: applied was
-            # a byte-for-byte copy of event 8's).
+        # Whichever half did NOT run this cycle is never touched by the robot
+        # call above, so its log field would otherwise still hold whatever it
+        # was left at by a PREVIOUS, unrelated intervention -- misleadingly
+        # implying that half also happened this cycle (confirmed live,
+        # DEBUG17 event 9, for the "neither ran" case: applied was a
+        # byte-for-byte copy of event 8's). With SEQUENTIAL_ACTIONS=True this
+        # is the COMMON case, not just the "neither fired" corner: a
+        # rotate-only event leaves last_move stale and a raise-only event
+        # leaves last_rotation stale, exactly the ambiguity the last_move /
+        # last_rotation split was meant to remove. Zero each side
+        # independently rather than only when both are absent.
+        if not rotated:
+            robot.last_rotation = {"requested": [0.0, 0.0, 0.0, 0.0],
+                                   "applied": [0.0, 0.0, 0.0, 0.0],
+                                   "clamped": False, "ok": True, "singularity": None}
+        if not moved_linear:
             robot.last_move = {"requested": [0.0, 0.0, 0.0, 0.0],
                                "applied": [0.0, 0.0, 0.0, 0.0],
                                "clamped": False, "ok": True, "singularity": None}

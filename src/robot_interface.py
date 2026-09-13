@@ -431,6 +431,52 @@ class SimulatedRobot(_RobotBase):
         self.history.append(self._pose.tolist())
         return True
 
+    def adjust_rotation(self, drot: float) -> bool:
+        """Overrides the base class's Cartesian version (base-frame `drz` via
+        move_relative), which writes self.last_MOVE -- so under simulation
+        self.last_rotation was NEVER populated and rot_applied/rot_ok read as
+        permanently blank on every --simulate dry run, the exact run mode used
+        to sanity-check the last_move/last_rotation split before going live.
+        Mirrors UR3Robot.adjust_rotation's CONTRACT instead: writes
+        last_rotation (not last_move), and caps cumulative rotation at
+        MAX_ROT_RAD independently of MAX_TILT_RAD, same as the real robot's
+        J6 path -- rather than sharing move_relative's combined
+        MAX_TILT_RAD+MAX_ROT_RAD orientation bound."""
+        if self.cfg.REQUIRE_SAFE_MODE and not self.is_safe():
+            self.last_rotation = {"requested": [0.0, 0.0, 0.0, drot], "applied": None,
+                                  "clamped": False, "ok": False, "singularity": None}
+            return False
+
+        new_accum = self._rotation_accum_rad + drot
+        clamped = False
+        if abs(new_accum) > self.cfg.MAX_ROT_RAD:
+            new_accum = self.cfg.MAX_ROT_RAD if new_accum > 0 else -self.cfg.MAX_ROT_RAD
+            drot = new_accum - self._rotation_accum_rad
+            clamped = True
+
+        cur = self.get_pose()
+        target = cur.copy()
+        target[3:] = compose_rotvec(target[3:], [0.0, 0.0, 1.0], drot)
+        target, env_clamped = self._clamp(target)
+
+        sing = None
+        if self.cfg.AVOID_SINGULARITIES:
+            sing = is_blocked(self.pose_margins(target), self.th)
+            if sing:
+                self._sing_blocks += 1
+                self.last_rotation = {"requested": [0.0, 0.0, 0.0, drot], "applied": None,
+                                      "clamped": True, "ok": False, "singularity": sing}
+                return False
+
+        ok = self._send_pose(target, asynchronous=True)
+        if ok:
+            self._rotation_accum_rad = new_accum
+        self.last_rotation = {"requested": [0.0, 0.0, 0.0, drot],
+                              "applied": [0.0, 0.0, 0.0, drot] if ok else None,
+                              "clamped": bool(clamped or env_clamped), "ok": bool(ok),
+                              "singularity": None}
+        return bool(ok)
+
     def close(self):
         pass
 

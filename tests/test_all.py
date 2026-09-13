@@ -226,21 +226,41 @@ def test_latency_uses_wall_clock():
 
 
 @test
-def test_drot_direction_uses_trunk_twist():
-    """REGRESSION: drot direction ignored trunk_twist_deg entirely and fell
-    back to a fixed sign whenever neck_twist_deg and neck_sidebend_deg were
-    both zero, even though trunk_twist_deg is a valid GAINS/DOF_REQUIRES
-    driver of drot."""
+def test_drot_direction_uses_neck_signal_not_trunk_twist():
+    """Superseded by the rig-test branch policy (see _head_turn_signal's
+    docstring): drot direction now follows ONLY neck_twist_deg / (with the
+    twist below the noise floor) neck_sidebend_deg -- the same signal
+    _rule_target uses for magnitude -- never trunk_twist_deg, which measures
+    a different physical quantity (torso-vs-hips) and stays nonzero
+    independent of head direction. This replaces the old
+    test_drot_direction_uses_trunk_twist, which asserted the pre-rig-policy
+    contract (drot sign sourced from trunk_twist_deg) that this branch
+    deliberately dropped; that test now fails against the current design, not
+    against a bug."""
     from pss_v2 import PSSv2Calculator, PostureAngles
     from goal_controller import GoalBasedController, _FakeRobot
     ctrl = GoalBasedController("experimental", PSSv2Calculator())
-    robot = _FakeRobot()
-    ang = PostureAngles(trunk_twist_deg=-25)  # neck_twist_deg, neck_sidebend_deg default to 0
-    ctrl._execute({"drot": 0.2}, ang, robot)
-    kind, applied = robot.moves[-1]
+
+    # trunk_twist_deg alone (neck_twist_deg, neck_sidebend_deg both 0) must no
+    # longer drive drot's sign: flipping it must not change the outcome.
+    robot_neg = _FakeRobot()
+    ctrl._execute({"drot": 0.2}, PostureAngles(trunk_twist_deg=-25), robot_neg)
+    robot_pos = _FakeRobot()
+    ctrl._execute({"drot": 0.2}, PostureAngles(trunk_twist_deg=25), robot_pos)
+    kind, applied_neg = robot_neg.moves[-1]
     assert kind == "adjust_rotation"
-    assert applied > 0, \
-        "drot sign must follow trunk_twist_deg, not fall back to a fixed default"
+    assert applied_neg == robot_pos.moves[-1][1], \
+        "trunk_twist_deg sign must no longer affect drot direction"
+
+    # neck_twist_deg, once above the noise floor, must drive the sign instead.
+    robot2 = _FakeRobot()
+    ctrl._execute({"drot": 0.2},
+                 PostureAngles(trunk_twist_deg=-25, neck_twist_deg=10.0), robot2)
+    robot3 = _FakeRobot()
+    ctrl._execute({"drot": 0.2},
+                 PostureAngles(trunk_twist_deg=-25, neck_twist_deg=-10.0), robot3)
+    assert robot2.moves[-1][1] * robot3.moves[-1][1] < 0, \
+        "opposite neck_twist_deg must flip drot direction"
 
 
 @test
@@ -264,6 +284,95 @@ def test_predicted_pss_is_pss_not_cost():
             assert "cost_before" in r, "optimizer cost should be kept separately"
             return
     raise AssertionError("no intervention fired")
+
+
+@test
+def test_head_turn_signal_does_not_mix_signals():
+    """REGRESSION (DEBUG17 event 7): neck_twist_deg=-5.57 (small but real,
+    below HEAD_TURN_TRIGGER_DEG=8) and neck_sidebend_deg=+14.12 (above
+    trigger) fired together. The old code picked MAGNITUDE from whichever
+    signal was big enough to trigger (sidebend, positive) but picked SIGN
+    from raw neck_twist_deg regardless of trigger (negative) -- direction and
+    size came from two different physical signals that disagreed. Both must
+    now come from the exact same call to _head_turn_signal, gated only by the
+    small HEAD_TWIST_NOISE_FLOOR_DEG (2 deg), not the 8 deg action trigger."""
+    from pss_v2 import PostureAngles
+    from goal_controller import GoalBasedController, ControllerConfig
+    ctrl = GoalBasedController("experimental")
+    ang = PostureAngles(neck_twist_deg=-5.57, neck_sidebend_deg=14.12)
+
+    sig = ctrl._head_turn_signal(ang, ControllerConfig)
+    assert sig == ang.neck_twist_deg, \
+        "twist is above the noise floor; it alone must supply sign AND magnitude"
+
+    # Below HEAD_TURN_TRIGGER_DEG (8), so this must not fire at all -- NOT
+    # fire with sidebend's magnitude and twist's sign, which is what event 7
+    # actually did live.
+    delta = ctrl._rule_target(ang, {}, ControllerConfig)
+    assert abs(delta["drot"]) < 1e-9, \
+        f"a below-trigger, correctly-signed twist must not trigger rotation: {delta}"
+
+
+@test
+def test_head_turn_signal_falls_back_to_sidebend_below_noise_floor():
+    """The other half of the event-7 fix: when twist genuinely is noise
+    (< HEAD_TWIST_NOISE_FLOOR_DEG), sidebend must still supply both sign and
+    magnitude -- this is what lets standing-straight head TILT (no twist)
+    drive rotation at all."""
+    from pss_v2 import PostureAngles
+    from goal_controller import GoalBasedController, ControllerConfig
+    ctrl = GoalBasedController("experimental")
+    ang = PostureAngles(neck_twist_deg=0.4, neck_sidebend_deg=14.12)
+    sig = ctrl._head_turn_signal(ang, ControllerConfig)
+    assert sig == ang.neck_sidebend_deg, \
+        "twist is noise-floor-small; sidebend must supply sign AND magnitude"
+
+
+@test
+def test_execute_does_not_leave_stale_data_in_untouched_half():
+    """REGRESSION (DEBUG17 events 9-11): _execute() calls robot.adjust_rotation
+    and robot.move_relative independently. Whichever one does NOT run in a
+    given cycle must not leave the OTHER call's field holding a leftover
+    value from some earlier, unrelated intervention -- event 9 showed
+    last_move['applied'] byte-for-byte identical to the previous event
+    because nothing cleared it. This must hold not only when neither half
+    fires (the original fix) but also -- the common case under
+    SEQUENTIAL_ACTIONS=True -- when exactly one of the two fires."""
+    from pss_v2 import PostureAngles
+    from goal_controller import GoalBasedController, ControllerConfig
+    from robot_interface import SimulatedRobot
+
+    ctrl = GoalBasedController("experimental")
+
+    # Prime both fields with a real prior move so leftovers would be visible.
+    robot = SimulatedRobot()
+    robot.move_relative(dz=0.02)
+    robot.adjust_rotation(0.05)
+    stale_move = dict(robot.last_move)
+
+    # Pure rotation event: neck twist only, no lean.
+    ang_rot = PostureAngles(neck_twist_deg=20.0)
+    delta_rot = ctrl._rule_target(ang_rot, {}, ControllerConfig)
+    assert abs(delta_rot["dz"]) < 1e-9 and abs(delta_rot["drot"]) > 1e-9
+    ctrl._execute(delta_rot, ang_rot, robot)
+    assert robot.last_move["applied"] == [0.0, 0.0, 0.0, 0.0], \
+        f"last_move must be zeroed, not left at the prior event's value: {robot.last_move}"
+    assert robot.last_move != stale_move
+    assert robot.last_rotation["ok"] is True and robot.last_rotation["applied"], \
+        "last_rotation must show this cycle's real rotation"
+
+    # Pure raise event: forward lean only, no twist.
+    robot2 = SimulatedRobot()
+    robot2.move_relative(dz=0.02)
+    robot2.adjust_rotation(0.05)
+    ang_raise = PostureAngles(trunk_flexion_deg=40.0)
+    delta_raise = ctrl._rule_target(ang_raise, {}, ControllerConfig)
+    assert abs(delta_raise["drot"]) < 1e-9 and abs(delta_raise["dz"]) > 1e-9
+    ctrl._execute(delta_raise, ang_raise, robot2)
+    assert robot2.last_rotation["applied"] == [0.0, 0.0, 0.0, 0.0], \
+        f"last_rotation must be zeroed, not left at the prior event's value: {robot2.last_rotation}"
+    assert robot2.last_move["ok"] is True and any(abs(v) > 1e-9 for v in robot2.last_move["applied"]), \
+        "last_move must show this cycle's real raise"
 
 
 # --------------------------------------------------------------------------
@@ -322,6 +431,82 @@ def test_clamping_is_reported():
     for _ in range(20):
         r.move_relative(dz=0.08)
     assert r.last_move["clamped"] is True, "clamping not surfaced for logging"
+
+
+@test
+def test_sustained_combined_strain_can_starve_raise():
+    """CHARACTERIZATION, not yet a bug fix -- flag before the live session.
+
+    With SEQUENTIAL_ACTIONS=True and ACTION_PRIORITY={rotate:2, raise:1},
+    priority is a HARD gate re-evaluated every retrigger: whenever both a
+    twist/tilt AND a forward-lean condition are independently above trigger
+    in the SAME cycle, raise's delta is unconditionally zeroed, with no decay
+    or turn-taking that ever lets it through. If a person's posture keeps
+    both conditions true at once (a genuinely plausible combined-strain
+    posture, e.g. events 3-8 in the DEBUG17/18 logs), the forward-lean strain
+    is NEVER relieved for as long as that posture holds -- confirmed here
+    over 100+ simulated seconds / dozens of retriggers, raise fires zero
+    times. Before the original branch policy change this went the other way
+    (raise dominated, rotate never fired -- the bug this branch was created
+    to fix); this test exists so a flip back toward that failure, or a
+    genuine starvation report from tomorrow's live session, is recognized
+    immediately rather than re-discovered from scratch. If live testing shows
+    raise never getting a turn during combined trials, revisit
+    ACTION_PRIORITY / SEQUENTIAL_ACTIONS (e.g. alternate priority per episode
+    instead of a fixed winner)."""
+    from pss_v2 import PostureAngles, PSSv2Calculator
+    from goal_controller import GoalBasedController, ControllerConfig
+    from robot_interface import SimulatedRobot
+
+    pss = PSSv2Calculator()
+    pss.calibrate_neutral([PostureAngles() for _ in range(30)])
+    ctrl = GoalBasedController("experimental", pss_calc=pss)
+    robot = SimulatedRobot()
+    ang = PostureAngles(trunk_flexion_deg=45.0, neck_flexion_deg=22.0, neck_twist_deg=12.0)
+
+    t = 0.0
+    rotate_fired = raise_fired = 0
+    for _cycle in range(15):
+        for _ in range(12):
+            comp = pss.compute(ang, now=t)
+            r = ctrl.evaluate(comp, ang, robot, now=t)
+            if r.get("triggered"):
+                d = r["delta"]
+                rotate_fired += abs(d.get("drot", 0.0)) > 1e-9
+                raise_fired += abs(d.get("dz", 0.0)) > 1e-9
+            t += 0.2
+        t += ControllerConfig.COOLDOWN_S + 0.1
+
+    assert rotate_fired > 0, "expected setup: rotate should dominate"
+    assert raise_fired == 0, (
+        "raise fired at least once under sustained combined strain -- if this "
+        "assertion now fails, the priority/starvation behaviour described "
+        "above has changed; update this test to match the new intended "
+        "behaviour rather than deleting it")
+
+
+@test
+def test_simulated_robot_rotation_updates_last_rotation():
+    """REGRESSION: SimulatedRobot did not override adjust_rotation, so it fell
+    through to _RobotBase's version, which is implemented as move_relative
+    (drz=...) and therefore writes last_MOVE. last_rotation was silently
+    never populated in ANY --simulate run, so rot_applied/rot_ok/rot_clamped
+    -- the very fields the last_move/last_rotation split introduced -- always
+    read as blank/False in a dry run, which is exactly the run mode used to
+    sanity-check that split before trusting it live."""
+    from robot_interface import SimulatedRobot, RobotConfig
+    r = SimulatedRobot()
+    assert r.adjust_rotation(0.1) is True
+    assert r.last_rotation["ok"] is True
+    assert r.last_rotation["applied"] is not None
+    assert abs(r.last_rotation["applied"][3] - 0.1) < 1e-9
+
+    # Cumulative cap mirrors UR3Robot's: independent of MAX_TILT_RAD.
+    r2 = SimulatedRobot()
+    for _ in range(20):
+        r2.adjust_rotation(0.1)
+    assert abs(r2._rotation_accum_rad) <= RobotConfig.MAX_ROT_RAD + 1e-9
+    assert r2.last_rotation["clamped"] is True
 
 
 @test
