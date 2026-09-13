@@ -434,26 +434,79 @@ def test_clamping_is_reported():
 
 
 @test
-def test_sustained_combined_strain_can_starve_raise():
-    """CHARACTERIZATION, not yet a bug fix -- flag before the live session.
+def test_priority_hands_off_to_raise_once_rotate_condition_clears():
+    """Confirms the INTENDED design: with SEQUENTIAL_ACTIONS=True and
+    ACTION_PRIORITY={rotate:2, raise:1}, rotate is meant to keep taking every
+    retrigger for as long as its own condition (neck twist/tilt >= 8 deg)
+    stays true, then hand off to raise the moment that condition clears --
+    "execute priority repeatedly until it's satisfied, then move to the
+    other." Here neck_twist_deg decays from 18 deg toward 0 across retriggers
+    (standing in for the person's own twist easing off, e.g. because the
+    rotation correction already helped, or they naturally shift), while the
+    forward-lean condition stays on throughout. Confirms: every trigger while
+    twist >= 8 deg fires ONLY drot; the first trigger once twist < 8 deg, and
+    every one after, fires ONLY dz -- the handoff happens on the very next
+    retrigger, not stuck on rotate."""
+    from pss_v2 import PostureAngles, PSSv2Calculator
+    from goal_controller import GoalBasedController, ControllerConfig
+    from robot_interface import SimulatedRobot
 
-    With SEQUENTIAL_ACTIONS=True and ACTION_PRIORITY={rotate:2, raise:1},
-    priority is a HARD gate re-evaluated every retrigger: whenever both a
-    twist/tilt AND a forward-lean condition are independently above trigger
-    in the SAME cycle, raise's delta is unconditionally zeroed, with no decay
-    or turn-taking that ever lets it through. If a person's posture keeps
-    both conditions true at once (a genuinely plausible combined-strain
-    posture, e.g. events 3-8 in the DEBUG17/18 logs), the forward-lean strain
-    is NEVER relieved for as long as that posture holds -- confirmed here
-    over 100+ simulated seconds / dozens of retriggers, raise fires zero
-    times. Before the original branch policy change this went the other way
-    (raise dominated, rotate never fired -- the bug this branch was created
-    to fix); this test exists so a flip back toward that failure, or a
-    genuine starvation report from tomorrow's live session, is recognized
-    immediately rather than re-discovered from scratch. If live testing shows
-    raise never getting a turn during combined trials, revisit
-    ACTION_PRIORITY / SEQUENTIAL_ACTIONS (e.g. alternate priority per episode
-    instead of a fixed winner)."""
+    pss = PSSv2Calculator()
+    pss.calibrate_neutral([PostureAngles() for _ in range(30)])
+    ctrl = GoalBasedController("experimental", pss_calc=pss)
+    robot = SimulatedRobot()
+
+    t = 0.0
+    fired = []   # (twist_this_cycle, drot, dz)
+    for cycle in range(14):
+        twist = max(0.0, 18.0 - cycle * 1.5)   # crosses the 8 deg trigger around cycle 7
+        ang = PostureAngles(trunk_flexion_deg=45.0, neck_flexion_deg=22.0, neck_twist_deg=twist)
+        for _ in range(12):
+            comp = pss.compute(ang, now=t)
+            r = ctrl.evaluate(comp, ang, robot, now=t)
+            if r.get("triggered"):
+                d = r["delta"]
+                fired.append((twist, abs(d.get("drot", 0.0)) > 1e-9,
+                             abs(d.get("dz", 0.0)) > 1e-9))
+            t += 0.2
+        t += ControllerConfig.COOLDOWN_S + 0.1
+
+    assert len(fired) >= 4, "expected setup: several retriggers over the decay"
+    for twist, rotated, raised in fired:
+        if twist >= ControllerConfig.HEAD_TURN_TRIGGER_DEG:
+            assert rotated and not raised, \
+                f"twist={twist} still above trigger; rotate should still own this cycle"
+        else:
+            assert raised and not rotated, \
+                f"twist={twist} cleared the trigger; raise should have taken over"
+    # and the handoff must actually have been exercised both ways
+    assert any(r for _, r, _ in fired) and any(d for _, _, d in fired), \
+        "test setup did not exercise both rotate and raise -- widen the decay range"
+
+
+@test
+def test_priority_never_hands_off_if_rotate_condition_truly_never_clears():
+    """KNOWN, NARROW EDGE CASE -- not the same claim as before.
+
+    An earlier version of this test used a completely STATIC posture (twist
+    fixed at 12 deg for the whole run) and read the result as rotate
+    'starving' raise indefinitely. That was too strong a claim: it wasn't
+    testing the hand-off mechanism (see
+    test_priority_hands_off_to_raise_once_rotate_condition_clears, which
+    passes -- hand-off works correctly once the twist SIGNAL actually drops
+    below HEAD_TURN_TRIGGER_DEG), it was testing what happens when the
+    signal never varies at all, which is a much narrower situation.
+
+    This still matters for the live rig: ACTION_PRIORITY re-evaluates raw
+    twist/lean off the FRESH camera reading every cycle, with no fallback
+    that hands control to raise just because time has passed. So the only
+    real remaining risk is a person whose measured twist genuinely never
+    drops below 8 deg for the whole episode (a task that structurally
+    requires sustained twisting, not just an artifact of a synthetic test).
+    Whether that's realistic is a live-rig question, not something this
+    suite can answer -- see the note in INTERVENTION_BRANCH_TEST_PLAN.md
+    about holding a combined posture long enough to actually see (or rule
+    out) a handoff during tomorrow's session."""
     from pss_v2 import PostureAngles, PSSv2Calculator
     from goal_controller import GoalBasedController, ControllerConfig
     from robot_interface import SimulatedRobot
@@ -479,10 +532,9 @@ def test_sustained_combined_strain_can_starve_raise():
 
     assert rotate_fired > 0, "expected setup: rotate should dominate"
     assert raise_fired == 0, (
-        "raise fired at least once under sustained combined strain -- if this "
-        "assertion now fails, the priority/starvation behaviour described "
-        "above has changed; update this test to match the new intended "
-        "behaviour rather than deleting it")
+        "raise fired at least once with a perfectly static twist signal -- if "
+        "this assertion now fails, behaviour has changed; update this test to "
+        "match rather than deleting it")
 
 
 @test

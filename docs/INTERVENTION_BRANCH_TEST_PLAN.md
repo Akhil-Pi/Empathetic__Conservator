@@ -61,8 +61,10 @@ Regression tests for all of the above live in `tests/test_all.py`:
 `test_head_turn_signal_does_not_mix_signals`,
 `test_head_turn_signal_falls_back_to_sidebend_below_noise_floor`,
 `test_execute_does_not_leave_stale_data_in_untouched_half`,
-`test_simulated_robot_rotation_updates_last_rotation`. Run
-`python3 tests/test_all.py` and confirm these four pass (they do not need
+`test_simulated_robot_rotation_updates_last_rotation`,
+`test_priority_hands_off_to_raise_once_rotate_condition_clears`,
+`test_priority_never_hands_off_if_rotate_condition_truly_never_clears`. Run
+`python3 tests/test_all.py` and confirm these six pass (they do not need
 cv2, pandas, or a robot) before touching the rig.
 
 ## Test Steps
@@ -103,20 +105,34 @@ rotation; `dz` non-zero and `drot` zero is a pure raise.
   sign — this was event 7 live.
 - If the signed `drot` is correct but the fixture rotates the wrong physical
   way, flip `ControllerConfig.LATERAL_SIGN` or fix the robot-frame mapping.
-- **Watch for raise starvation during combined trials.** `ACTION_PRIORITY`
-  is a hard gate, re-checked every retrigger, not a one-time tie-break: as
-  long as a posture keeps BOTH the twist/tilt trigger and the lean trigger
-  true at once, rotate wins every single cycle and raise never fires — no
-  decay, no turn-taking. Confirmed in simulation: 135s / 30 retriggers of
-  sustained combined lean+twist produced 30 rotations and **zero** raises
-  (see `test_sustained_combined_strain_can_starve_raise` in
-  `tests/test_all.py`). This is the mirror image of the original bug this
-  branch was created to fix (then: raise dominated, rotate never fired). If
-  the combined trial (step 3 above) shows `dz` never firing while `drot`
-  keeps firing every retrigger, this is why — it's a policy gap
-  (`ACTION_PRIORITY`/`SEQUENTIAL_ACTIONS` in `ControllerConfig`), not a new
-  logging bug, and needs a design decision (e.g. alternate priority per
-  episode) rather than a quick patch.
+- **Watch how the combined trial hands off between rotate and raise.**
+  `ACTION_PRIORITY` is intended to work like this: rotate (the higher
+  priority) keeps taking every retrigger for as long as ITS OWN condition
+  (twist/tilt ≥ 8°) is still true on the freshly-read camera angles, then
+  hands off to raise the instant that condition clears — "run the priority
+  action until it's satisfied, then move to the other." Simulated in
+  `test_priority_hands_off_to_raise_once_rotate_condition_clears`
+  (`tests/test_all.py`): with a decaying twist signal and a constant lean
+  signal, rotate fires every cycle while twist ≥ 8°, and raise takes over on
+  the very next cycle once twist drops below 8° — the mechanism works as
+  designed.
+  **The catch, for the rig:** the hand-off only happens if the measured
+  twist/tilt signal actually drops below 8° at some point. There is no
+  fallback that hands control to raise just because time has passed or a
+  retrigger count was reached — `ACTION_PRIORITY` re-reads the raw signal
+  fresh every cycle. `test_priority_never_hands_off_if_rotate_condition_truly_never_clears`
+  pins the extreme case (a signal that never moves at all: 15 retriggers,
+  rotate every time, raise never) so this doesn't get silently
+  "fixed" or re-discovered from scratch later. So during the combined trial
+  (step 3 above): if you hold a combined posture and see `drot` fire on
+  every retrigger while `dz` never does, first check whether your OWN
+  twist/tilt is actually staying above 8° the whole time (deliberately keep
+  it fixed to test the worst case) or whether it's naturally easing off
+  (normal test conditions) — the 3-second hold in step 3 is too short to
+  see more than one trigger anyway, so for this specific check hold the
+  combined posture for 20-30s and watch whether `dz` ever appears. If it
+  never does even though your twist genuinely eased off partway through,
+  that's a real bug, not the known edge case above.
 - **Singularity refusals late in a session** (`singularity=radius` after
   several raises): expected if `dz` has accumulated toward the envelope edge
   — this is the safety clamp doing its job, not a fault. Don't spend time
