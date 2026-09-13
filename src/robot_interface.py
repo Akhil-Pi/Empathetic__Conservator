@@ -74,9 +74,13 @@ class RobotConfig:
 
     # Conservative motion near a person. Slower is safer, but note that motion
     # time lands inside the measured intervention latency, which is an input to
-    # the latency-vs-recovery analysis. Keep this FIXED across all sessions.
-    SPEED_MS = 0.03               # m/s, TCP linear
-    ACCEL_MS2 = 0.10              # m/s^2
+    # the latency-vs-recovery analysis. Keep this FIXED across all sessions
+    # once real participant data collection starts (lowered from 0.03/0.10
+    # during rig tuning -- the old values were fast enough that small raise
+    # steps (~1cm) barely cleared ACCEL_MS2's ramp-up before stopping, which
+    # read as an abrupt jerk rather than a smooth raise).
+    SPEED_MS = 0.015               # m/s, TCP linear
+    ACCEL_MS2 = 0.05              # m/s^2
     BLEND_R = 0.0
 
     # Absolute workspace envelope in the ROBOT BASE frame (metres). This bounds

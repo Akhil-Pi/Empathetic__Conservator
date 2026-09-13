@@ -53,10 +53,10 @@ class ControllerConfig:
     # intervention so no move is ever a large jump.
     DOF = ["dz", "dy", "dtilt", "drot", "dx"]
     STEP_LIMIT = {
-        "dz":    0.03,   # raise / lower, m
+        "dz":    0.02,   # raise / lower, m
         "dy":    0.02,   # toward / away from worker, m
         "dtilt": 0.10,   # end-effector tilt, rad
-        "drot":  0.08,   # rotation about vertical, rad
+        "drot":  0.15,   # rotation about vertical, rad
         "dx":    0.02,   # lateral, m
     }
 
@@ -163,8 +163,48 @@ class ControllerConfig:
     HEAD_TURN_SATURATION_DEG = 30.0
     FORWARD_LEAN_TRIGGER_DEG = 15.0
     FORWARD_LEAN_SATURATION_DEG = 45.0
-    HEAD_ROT_STEP_RAD = 0.08
-    FORWARD_RAISE_STEP_M = 0.015
+    HEAD_ROT_STEP_RAD = 0.15
+    FORWARD_RAISE_STEP_M = 0.008
+
+    # ---- (1) action weights, and (2) which acts first when both fire ----
+    #
+    # The two rig-test actions are "rotate" (head turn/tilt -> drot) and
+    # "raise" (forward lean -> dz). They can both be triggered in the same
+    # cycle. Two things need deciding: how strongly each acts, and, when both
+    # fire, which goes first.
+    #
+    # ACTION_WEIGHT scales the step each action takes, 0..1. It is a straight
+    # multiplier on that action's computed step, so 1.0 is the full configured
+    # step (HEAD_ROT_STEP_RAD / FORWARD_RAISE_STEP_M) and 0.5 is half. Use it
+    # to make one motion more assertive than the other, or to damp one that
+    # feels too aggressive on the rig, without touching its trigger or its
+    # saturation curve.
+    ACTION_WEIGHT = {
+        "rotate": 1.0,
+        "raise":  1.0,
+    }
+
+    # ACTION_PRIORITY decides ORDER when both actions fire in the same cycle:
+    # the higher number goes first. "Goes first" here means it is the action
+    # executed at the start of the combined move -- with SEQUENTIAL_ACTIONS
+    # True (below) the lower-priority action waits for the next cycle entirely,
+    # so priority becomes "which problem to fix first" rather than just move
+    # ordering. Rotation defaults to higher priority because a twisted neck is
+    # a sharper, more localised strain than a forward lean and is quicker to
+    # correct (one axis, no reach into the workspace). Flip these two numbers
+    # to raise-first if rig testing shows lean is the more urgent correction.
+    ACTION_PRIORITY = {
+        "rotate": 2,
+        "raise":  1,
+    }
+
+    # If True, when both actions fire only the higher-priority one executes
+    # this cycle; the other waits for the next trigger. This makes each
+    # intervention a single, clearly-attributable motion (easier to see on the
+    # rig and to read in the logs) at the cost of taking two cycles to correct
+    # a combined twist+lean. If False, both execute in the same move, ordered
+    # by ACTION_PRIORITY (rotation-first-then-raise if rotate outranks raise).
+    SEQUENTIAL_ACTIONS = True
 
     # Optimiser resolution.
     LINE_SEARCH_POINTS = 21
@@ -185,7 +225,12 @@ DOF_REQUIRES = {
     "dz":    ("trunk_flexion_deg", "neck_flexion_deg"),
     "dy":    ("trunk_flexion_deg",),
     "dtilt": ("neck_flexion_deg",),
-    "dx":    ("trunk_sidebend_deg", "neck_sidebend_deg"),
+    # Lateral shift is driven by TRUNK side-bend only. neck_sidebend_deg is
+    # deliberately NOT here: the rig-test rotate action uses it as a head-tilt
+    # signal (see _head_turn_signal), so it drives ROTATION, and a layout that
+    # measures it for rotation must not thereby also enable lateral shift. This
+    # is what lets ROTATE_RAISE_SPLIT bind the front camera to rotation only.
+    "dx":    ("trunk_sidebend_deg",),
     "drot":  ("trunk_twist_deg", "neck_twist_deg", "neck_sidebend_deg",
               "lateral_gaze_deg"),
 }
@@ -520,35 +565,58 @@ class GoalBasedController:
 
     def _rule_target(self, angles: PostureAngles, pss_components: dict,
                      cfg=ControllerConfig) -> Dict[str, float]:
-        """Simple rig-test policy: head twist/side-bend -> rotate, forward
-        lean -> raise, independently -- both fire in the same call when both
-        are present (twisted/tilted AND leaning), so the artifact rotates AND
-        keeps raising for as long as the lean stays above
-        FORWARD_LEAN_TRIGGER_DEG. _execute() sequences rotation before the
-        raise on a combined move."""
+        """
+        Rig-test policy: head twist/tilt -> rotate (drot), forward lean ->
+        raise (dz). Each is triggered independently.
+
+        (1) ACTION_WEIGHT scales each action's step so one can be made more
+            assertive than the other.
+        (2) When BOTH fire, ACTION_PRIORITY decides order, and if
+            SEQUENTIAL_ACTIONS is set only the higher-priority action runs this
+            cycle (the other waits for the next trigger). Both decisions live
+            in config, not hard-coded here or in _execute.
+        """
         delta = {d: 0.0 for d in cfg.DOF}
 
+        # -- rotate action --
         head_signal = self._head_turn_signal(angles, cfg)
-        if abs(head_signal) >= cfg.HEAD_TURN_TRIGGER_DEG and "drot" in self.dof:
+        rotate_fires = abs(head_signal) >= cfg.HEAD_TURN_TRIGGER_DEG and "drot" in self.dof
+        if rotate_fires:
             scale = min(abs(head_signal) / cfg.HEAD_TURN_SATURATION_DEG, 1.0)
-            delta["drot"] = min(cfg.HEAD_ROT_STEP_RAD * scale,
+            w = cfg.ACTION_WEIGHT.get("rotate", 1.0)
+            delta["drot"] = min(cfg.HEAD_ROT_STEP_RAD * scale * w,
                                  cfg.STEP_LIMIT["drot"])
 
+        # -- raise action --
         trunk_flex = pss_components.get("trunk_flexion_deg", angles.trunk_flexion_deg)
         neck_flex = pss_components.get("neck_flexion_deg", angles.neck_flexion_deg)
         forward_signal = max(float(trunk_flex), float(neck_flex))
-        if forward_signal >= cfg.FORWARD_LEAN_TRIGGER_DEG and "dz" in self.dof:
+        raise_fires = forward_signal >= cfg.FORWARD_LEAN_TRIGGER_DEG and "dz" in self.dof
+        if raise_fires:
             scale = min(forward_signal / cfg.FORWARD_LEAN_SATURATION_DEG, 1.0)
-            delta["dz"] = min(cfg.FORWARD_RAISE_STEP_M * scale,
-                               cfg.STEP_LIMIT["dz"])
+            w = cfg.ACTION_WEIGHT.get("raise", 1.0)
+            delta["dz"] = min(cfg.FORWARD_RAISE_STEP_M * scale * w,
+                              cfg.STEP_LIMIT["dz"])
+
+        # (2) if both fired and we want one clean motion per cycle, keep only
+        # the higher-priority action; the other fires on the next trigger.
+        if rotate_fires and raise_fires and getattr(cfg, "SEQUENTIAL_ACTIONS", False):
+            if cfg.ACTION_PRIORITY.get("rotate", 0) >= cfg.ACTION_PRIORITY.get("raise", 0):
+                delta["dz"] = 0.0
+            else:
+                delta["drot"] = 0.0
 
         return delta
 
     def _execute(self, delta: Dict[str, float], angles: PostureAngles, robot) -> bool:
-        """One smooth move to the target. Rotation about vertical via
-        adjust_rotation happens FIRST, then translation + tilt via
-        move_relative -- on a combined twist+lean trigger the artifact
-        rotates to the head-turn direction before it starts raising."""
+        """
+        Execute the command. When both a rotation and a linear move are
+        present, their ORDER follows ControllerConfig.ACTION_PRIORITY -- the
+        higher-priority action goes first -- rather than being hard-coded. With
+        SEQUENTIAL_ACTIONS set, _rule_target has already zeroed the
+        lower-priority action, so only one of these runs anyway; this ordering
+        only matters when SEQUENTIAL_ACTIONS is False and both run in one cycle.
+        """
         command = self._execution_delta(delta, angles)
         dz = command["dz"]
         dy = command["dy"]
@@ -558,11 +626,27 @@ class GoalBasedController:
 
         rotated = abs(drot) > 1e-4
         moved_linear = any(abs(v) > 1e-4 for v in (dx, dy, dz, dtilt))
-        ok = True
+
+        def _do_rotate():
+            return robot.adjust_rotation(drot)
+
+        def _do_linear():
+            return robot.move_relative(dx=dx, dy=dy, dz=dz, drx=dtilt,
+                                       asynchronous=True)
+
+        # order the two sub-moves by configured priority (higher first)
+        pri = self.cfg.ACTION_PRIORITY
+        steps = []
         if rotated:
-            ok = robot.adjust_rotation(drot) and ok
+            steps.append((pri.get("rotate", 0), _do_rotate))
         if moved_linear:
-            ok = robot.move_relative(dx=dx, dy=dy, dz=dz, drx=dtilt, asynchronous=True) and ok
+            steps.append((pri.get("raise", 0), _do_linear))
+        steps.sort(key=lambda t: t[0], reverse=True)
+
+        ok = True
+        for _, fn in steps:
+            ok = fn() and ok
+
         if not rotated and not moved_linear:
             # Neither sub-move cleared the 1e-4 threshold, so robot.last_move
             # is never touched this cycle -- without this, the event log

@@ -200,6 +200,38 @@ LAYOUTS: Dict[str, CameraLayout] = {
             "projected shoulder line against the hip line rather than measured "
             "directly, hence the reduced confidence.",)),
 
+    # Explicit one-camera-per-motion split for the rig-test policy:
+    #   SIDE  camera -> sagittal flexion  -> drives the RAISE action (dz)
+    #   FRONT camera -> twist / side-bend -> drives the ROTATE action (drot)
+    # Physically identical cameras to SIDE_FRONT, but this layout documents and
+    # enforces the intent: each of the two rig-test actions is fed by exactly
+    # one camera, so a fault or occlusion on one camera disables one action and
+    # leaves the other fully working, rather than silently degrading both. The
+    # DOF interlock (goal_controller.DOF_REQUIRES) already routes dz off the
+    # sagittal angles and drot off the twist/side-bend angles, so declaring the
+    # measurable sets this way is all that is needed to bind each action to its
+    # camera.
+    "ROTATE_RAISE_SPLIT": CameraLayout(
+        name="ROTATE_RAISE_SPLIT", n_cameras=2,
+        placements=(CAM_SIDE, CAM_FRONT),
+        measurable=SAGITTAL_ANGLES + ("trunk_twist_deg", "neck_twist_deg",
+                                      "neck_sidebend_deg"),
+        confidence_scale={a: 1.0 for a in SAGITTAL_ANGLES}
+                         | {"trunk_twist_deg": 0.6, "neck_twist_deg": 0.6,
+                            "neck_sidebend_deg": 1.0},
+        recommended=True,
+        rationale=(
+            "One camera per motion. The SIDE camera resolves the sagittal "
+            "plane and is the sole driver of the RAISE action; the FRONT "
+            "camera resolves head twist and tilt and is the sole driver of "
+            "the ROTATE action. Use this for the rig-test policy when you want "
+            "each action attributable to exactly one camera."),
+        limitations=(
+            "Pure lateral shift (dx) is intentionally NOT enabled here: "
+            "trunk_sidebend_deg is left out of the measurable set so the front "
+            "camera drives rotation only, keeping the split clean. If you need "
+            "lateral tracking as well, use SIDE_FRONT.",)),
+
     "SIDE_ONLY": CameraLayout(
         name="SIDE_ONLY", n_cameras=1,
         placements=(CAM_SIDE,),
