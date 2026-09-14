@@ -210,7 +210,16 @@ class ControllerConfig:
     # rig and to read in the logs) at the cost of taking two cycles to correct
     # a combined twist+lean. If False, both execute in the same move, ordered
     # by ACTION_PRIORITY (rotation-first-then-raise if rotate outranks raise).
-    SEQUENTIAL_ACTIONS = True
+    #
+    # Set to False 2026-09-14 (live tests DEBUG23/24): with True, raise was
+    # being discarded, not just delayed. Of 23 rotate-only events across
+    # those two sessions, 11 (48%) had forward_signal already above
+    # FORWARD_LEAN_TRIGGER_DEG at the same instant -- a real, independently
+    # satisfied raise condition -- but ACTION_PRIORITY zeroed it outright
+    # every time rotate also fired, which live testing showed happens often
+    # (a natural combined lean+head-turn), not just in a rare edge case. This
+    # violates the original spec: both should trigger when both are present.
+    SEQUENTIAL_ACTIONS = False
 
     # Optimiser resolution.
     LINE_SEARCH_POINTS = 21
