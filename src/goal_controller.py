@@ -501,8 +501,24 @@ class GoalBasedController:
         # the trigger logic is driven by an injected `now` (replay / testing).
         latency = time.time() - t_arm_wall
 
+        # An "empty" trigger (neither rotate's nor raise's own condition was
+        # met -- pss crossed THRESHOLD on something this policy never acts
+        # on, e.g. arm posture) must not cost the same COOLDOWN_S as a real
+        # move: with a single shared cooldown, it was blocking a genuine
+        # rotate/raise trigger that could occur moments later, for the sake
+        # of a cycle that did nothing (confirmed live, DEBUG25: 57% of
+        # triggers were empty, driven by upper_arm_flexion_deg ~60-80 deg
+        # with trunk/neck near neutral -- arm posture is not, and should not
+        # become, part of what this policy acts on; see the note on
+        # ControllerConfig.THRESHOLD's tension with FORWARD_LEAN_TRIGGER_DEG).
+        # _above_since IS still reset unconditionally below: not resetting it
+        # would let the very next frame re-satisfy the same dwell instantly
+        # (a busy loop re-triggering every frame instead of every
+        # SUSTAINED_S), which is worse than the cooldown it would save.
+        non_empty = any(abs(v) > 1e-4 for v in delta.values())
         self._count += 1
-        self._last_intervention_at = now
+        if non_empty:
+            self._last_intervention_at = now
         self._above_since = None
         self._in_corrected = True
 
