@@ -165,10 +165,24 @@ class ControllerConfig:
     # almost never reached 15 deg at the exact instant a cycle fired -- closest
     # miss was 14.28 deg (DEBUG22 t=63.458s) -- and across all three sessions
     # no more than one continuous 2s dwell above 15 deg ever occurred, so raise
-    # fired on only 2 of 40 triggered events. 10 is untested live; re-check
-    # against a fresh events.csv rather than assuming this alone fixes it.
-    FORWARD_LEAN_TRIGGER_DEG = 10.0
-    FORWARD_LEAN_SATURATION_DEG = 45.0
+    # fired on only 2 of 40 triggered events.
+    # Lowered again, 10 -> 7 (2026-09-14, live tests DEBUG26-28): 10 deg does
+    # trigger reliably now, but DEBUG28 showed the bare-minimum-trigger move is
+    # tiny enough (1.8mm, ~0.12s at SPEED_MS) to be visually imperceptible --
+    # the participant's coworker only noticed the robot move on the THIRD
+    # raise of that session (trunk=36.8 deg), not the first (trunk=10.3 deg).
+    FORWARD_LEAN_TRIGGER_DEG = 7.0
+    # Lowered from 45 -> 25 in the same pass: dz = FORWARD_RAISE_STEP_M * scale,
+    # scale = forward_signal / FORWARD_LEAN_SATURATION_DEG, so a bare-trigger
+    # move's size is tied to how far below saturation the trigger sits, NOT to
+    # FORWARD_LEAN_TRIGGER_DEG. Lowering the trigger ALONE (without this)
+    # would have made the bare-minimum move even smaller (5/45=11% of full
+    # step, vs the already-invisible 10/45=22%) -- the opposite of what was
+    # wanted. Lowering saturation instead compresses the ramp so a modest lean
+    # reaches a much larger fraction of FORWARD_RAISE_STEP_M sooner, without
+    # touching that step ceiling itself (left alone deliberately -- see
+    # FORWARD_RAISE_STEP_M below, amplitude reduction there is intentional).
+    FORWARD_LEAN_SATURATION_DEG = 25.0
     HEAD_ROT_STEP_RAD = 0.15
     FORWARD_RAISE_STEP_M = 0.008
 
