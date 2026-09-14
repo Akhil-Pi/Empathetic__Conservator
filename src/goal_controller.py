@@ -161,7 +161,13 @@ class ControllerConfig:
     # which signal to believe, not whether to act on it.
     HEAD_TWIST_NOISE_FLOOR_DEG = 2.0
     HEAD_TURN_SATURATION_DEG = 30.0
-    FORWARD_LEAN_TRIGGER_DEG = 15.0
+    # Lowered from 15 -> 10 (2026-09-14, live tests DEBUG20-22): forward_signal
+    # almost never reached 15 deg at the exact instant a cycle fired -- closest
+    # miss was 14.28 deg (DEBUG22 t=63.458s) -- and across all three sessions
+    # no more than one continuous 2s dwell above 15 deg ever occurred, so raise
+    # fired on only 2 of 40 triggered events. 10 is untested live; re-check
+    # against a fresh events.csv rather than assuming this alone fixes it.
+    FORWARD_LEAN_TRIGGER_DEG = 10.0
     FORWARD_LEAN_SATURATION_DEG = 45.0
     HEAD_ROT_STEP_RAD = 0.15
     FORWARD_RAISE_STEP_M = 0.008
