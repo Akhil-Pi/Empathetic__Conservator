@@ -145,7 +145,7 @@ class ControllerConfig:
                                 # about 2.0: more than any achievable PSS gain.
 
     # Trigger logic (kept from the reactive policy; these parts were sound).
-    THRESHOLD = 0.25
+    THRESHOLD = 0.18
     HYSTERESIS = 0.08
     SUSTAINED_S = 2.0
     COOLDOWN_S = 2.0

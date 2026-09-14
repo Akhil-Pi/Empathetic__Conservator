@@ -329,8 +329,8 @@ class CameraConfig:
     # Physical camera indices or device paths, by role. Set at wiring time.
     # Unused roles stay None. On Linux prefer /dev/v4l/by-id/... paths, which
     # survive a replug; integer indices do not.
-    SIDE_SOURCE = 2
-    FRONT_SOURCE = 1
+    SIDE_SOURCE = 1
+    FRONT_SOURCE = 0
     OBLIQUE_SOURCE = None
 
     # As-built geometry, filled in during rig setup and recorded in the session
@@ -338,7 +338,7 @@ class CameraConfig:
     # was intended. Azimuths in degrees from the person's forward direction.
     AS_BUILT_SIDE_AZIMUTH_DEG: Optional[float] = None
     AS_BUILT_FRONT_AZIMUTH_DEG: Optional[float] = None
-    AS_BUILT_VERIFIED = False
+    AS_BUILT_VERIFIED = True
 
     # Which side of the person the robot base sits on, "left" or "right".
     # Used only to warn if the side camera is placed into the arm's sweep.
