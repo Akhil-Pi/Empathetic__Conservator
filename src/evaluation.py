@@ -238,6 +238,15 @@ def plot_bland_altman(result: dict, out_path: str) -> None:
 # --------------------------------------------------------------------------
 
 def _session_pss_summary(frames: pd.DataFrame) -> dict:
+    # TODO(gesture-pause-resume): frames logged while a gesture-driven pause
+    # was active (frames["paused"] == 1, see session_logger_v2.FRAME_COLUMNS
+    # and gesture_control.py) are NOT excluded here. Paused time is not
+    # "monitored task time" in the sense this analysis assumes -- interventions
+    # cannot fire during a pause -- so it should arguably be dropped from both
+    # mean_pss and frac_above_threshold before this statistic is trusted for
+    # a study that actually uses gesture control. Left as a TODO rather than
+    # changed now: excluding it changes an existing, already-relied-on
+    # statistic, which is a decision for the study lead, not a silent default.
     pss = frames["pss_smooth"].to_numpy(dtype=float)
     pss = pss[~np.isnan(pss)]
     return {

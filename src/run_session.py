@@ -111,13 +111,62 @@ def build_stack(condition: str, simulate: bool, model_path: str,
     return dual, det_side, det_front, pss, ctrl, robot, fuse_masked
 
 
+def build_gesture_control(det_side, det_front, model_path=None):
+    """
+    Construct gesture pause/resume support if GestureConfig.ENABLED, reusing
+    whichever camera frame the task loop already reads -- this never opens a
+    second capture. Returns a dict:
+
+        recognizer  GestureRecognizerWrapper, or None
+        state       gesture_control.PauseStateMachine, or None
+        camera      "front" / "side" -- which already-read frame to run
+                    detection on each cycle -- or None
+
+    All three are None when the feature is disabled (GestureConfig.ENABLED is
+    False, the default), when the active camera layout has neither camera
+    that could serve, or when the model file is missing. The task loop treats
+    a None recognizer as "gesture control is off for this run" and behaves
+    exactly as it did before this feature existed -- this function is the
+    only place that decides that.
+    """
+    from gesture_control import GestureConfig, PauseStateMachine
+    disabled = {"recognizer": None, "state": None, "camera": None}
+    if not GestureConfig.ENABLED:
+        return disabled
+
+    have = {"front": det_front is not None, "side": det_side is not None}
+    order = [GestureConfig.CONTROL_CAMERA] + \
+            [r for r in ("front", "side") if r != GestureConfig.CONTROL_CAMERA]
+    camera = next((r for r in order if have.get(r)), None)
+    if camera is None:
+        logger.warning("gesture control: no camera available in this layout; "
+                       "disabling gesture control for this run")
+        return disabled
+    if camera != GestureConfig.CONTROL_CAMERA:
+        logger.warning(f"gesture control: preferred camera "
+                       f"'{GestureConfig.CONTROL_CAMERA}' not in this layout; "
+                       f"falling back to '{camera}'")
+
+    from gesture_control import GestureRecognizerWrapper
+    try:
+        recognizer = GestureRecognizerWrapper(model_path=model_path)
+    except FileNotFoundError as e:
+        logger.warning(f"gesture control: {e}; disabling gesture control "
+                       f"for this run")
+        return disabled
+    return {"recognizer": recognizer, "state": PauseStateMachine(), "camera": camera}
+
+
 def run(participant: str, condition: str, minutes: float, simulate: bool,
         model_path: str, log_dir: str, calib_s: float,
-        side_index=None, front_index=None, preview=False):
+        side_index=None, front_index=None, preview=False,
+        gesture_model_path=None):
     from session_logger_v2 import SessionLoggerV2
 
     dual, det_side, det_front, pss, ctrl, robot, fuse = build_stack(
         condition, simulate, model_path, side_index, front_index)
+    gesture = build_gesture_control(det_side, det_front, gesture_model_path)
+    paused = False
     log = SessionLoggerV2(participant, condition, log_dir=log_dir)
 
     try:
@@ -185,42 +234,73 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
             angles = fuse(side_world, front_world)
             comp = pss.compute(angles)
 
+            # ---- gesture pause/resume (task phase only, never calibration) ----
+            # Runs on whichever camera frame the loop already read above; never
+            # opens a second capture. A None recognizer means the feature is
+            # off (disabled, unavailable for this layout, or missing model)
+            # and this block is a no-op, leaving `paused` False for the whole
+            # session -- identical to pre-gesture-control behaviour.
+            g_label, g_score = None, 0.0
+            if gesture["recognizer"] is not None:
+                g_frame = ff if gesture["camera"] == "front" else sf
+                if g_frame is not None:
+                    g_label, g_score = gesture["recognizer"].detect(g_frame, ms)
+                new_state = gesture["state"].update(g_label, g_score, now=time.time())
+                if new_state == "PAUSED" and not paused:
+                    paused = True
+                    log.log_event("pause", comp["pss_smooth"],
+                                  details=f"gesture={g_label} score={g_score:.3f}")
+                elif new_state == "RUNNING" and paused:
+                    paused = False
+                    # A dwell timer that was already counting up before the
+                    # pause must not carry across it and fire on the very
+                    # first post-resume frame.
+                    ctrl.reset_dwell_timer()
+                    log.log_event("resume", comp["pss_smooth"],
+                                  details=f"gesture={g_label} score={g_score:.3f}")
+
             log.log_frame(angles, comp,
                           arm_side=getattr(angles, "arm_side", ""),
-                          skew_ms=abs(s_ts - f_ts) * 1000.0)
+                          skew_ms=abs(s_ts - f_ts) * 1000.0,
+                          paused=paused)
             frames += 1
 
-            # The controller derives motion DIRECTION from angle sign, so it
-            # must see the same neutral-corrected angles that drive the PSS
-            # score, not the raw fuse() output.
-            result = ctrl.evaluate(comp, pss.calibrated_angles(angles), robot)
-            if result.get("triggered"):
-                lm = getattr(robot, "last_move", {}) or {}
-                lr = getattr(robot, "last_rotation", {}) or {}
-                command = result.get("command_delta", {}) or {}
-                diag_angles = result.get("diagnostic_angles", {}) or {}
-                log.log_event("intervention", comp["pss_smooth"], result=result,
-                              details=f"clamped={lm.get('clamped')} "
-                                      f"applied={lm.get('applied')} "
-                                      f"ok={lm.get('ok')} "
-                                      f"singularity={lm.get('singularity')} "
-                                      f"rot_applied={lr.get('applied')} "
-                                      f"rot_ok={lr.get('ok')} "
-                                      f"rot_clamped={lr.get('clamped')} "
-                                      f"rot_singularity={lr.get('singularity')} "
-                                      f"policy={result.get('policy')} "
-                                      f"command={command} "
-                                      f"angles={diag_angles}")
-                if lm.get("singularity"):
-                    logger.warning(f"intervention refused near a "
-                                   f"{lm['singularity']} singularity")
+            # While paused: keep reading/logging frames (above), but issue no
+            # new interventions -- in --live this is what keeps the robot
+            # holding its current pose, since it only ever moves in response
+            # to a triggered evaluate() result.
+            if not paused:
+                # The controller derives motion DIRECTION from angle sign, so
+                # it must see the same neutral-corrected angles that drive the
+                # PSS score, not the raw fuse() output.
+                result = ctrl.evaluate(comp, pss.calibrated_angles(angles), robot)
+                if result.get("triggered"):
+                    lm = getattr(robot, "last_move", {}) or {}
+                    lr = getattr(robot, "last_rotation", {}) or {}
+                    command = result.get("command_delta", {}) or {}
+                    diag_angles = result.get("diagnostic_angles", {}) or {}
+                    log.log_event("intervention", comp["pss_smooth"], result=result,
+                                  details=f"clamped={lm.get('clamped')} "
+                                          f"applied={lm.get('applied')} "
+                                          f"ok={lm.get('ok')} "
+                                          f"singularity={lm.get('singularity')} "
+                                          f"rot_applied={lr.get('applied')} "
+                                          f"rot_ok={lr.get('ok')} "
+                                          f"rot_clamped={lr.get('clamped')} "
+                                          f"rot_singularity={lr.get('singularity')} "
+                                          f"policy={result.get('policy')} "
+                                          f"command={command} "
+                                          f"angles={diag_angles}")
+                    if lm.get("singularity"):
+                        logger.warning(f"intervention refused near a "
+                                       f"{lm['singularity']} singularity")
 
             # neutral console output: gives no cue about the condition
             print(f"  t={time.time()-t0:5.0f}s  frames={frames}", end="\r")
 
             if preview:
                 import cv2
-                def _draw(label, frame, world_dict, ang, comp):
+                def _draw(label, frame, world_dict, ang, comp, extra_lines=None):
                     if frame is None:
                         return
                     frame = cv2.resize(frame, (480, 360))
@@ -257,9 +337,24 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
                     for i, txt in enumerate(info):
                         cv2.putText(frame, txt, (8, 20 + i * 22),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    # optional extra status lines (gesture control), drawn
+                    # below the existing info box -- the box above is
+                    # unchanged either way
+                    if extra_lines:
+                        y0 = 25 + len(info) * 22 + 4
+                        cv2.rectangle(frame, (0, y0),
+                                     (220, y0 + 22 * len(extra_lines) + 6), (0, 0, 0), -1)
+                        for i, txt in enumerate(extra_lines):
+                            cv2.putText(frame, txt, (8, y0 + 18 + i * 22),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
                     cv2.imshow(label, frame)
                 _draw("side camera", sf, side_world, angles, comp)
-                _draw("front camera", ff, front_world, angles, comp)
+                gesture_lines = None
+                if gesture["recognizer"] is not None:
+                    status = "PAUSED" if paused else "RUNNING"
+                    gesture_lines = [f"gesture: {status}",
+                                     f"{g_label or '-'} ({g_score:.2f})"]
+                _draw("front camera", ff, front_world, angles, comp, extra_lines=gesture_lines)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     logger.info("\npreview closed by user")
                     break
@@ -281,6 +376,7 @@ def run(participant: str, condition: str, minutes: float, simulate: bool,
         for closer in (lambda: dual.stop(),
                        lambda: det_side and det_side.close(),
                        lambda: det_front and det_front.close(),
+                       lambda: gesture["recognizer"] and gesture["recognizer"].close(),
                        lambda: robot.close()):
             try:
                 closer()
@@ -300,6 +396,9 @@ def main(argv=None):
                    help="override CameraConfig.LAYOUT, e.g. SIDE_ONLY")
     p.add_argument("--side-index", type=int, default=None)
     p.add_argument("--front-index", type=int, default=None)
+    p.add_argument("--gesture-model", default=None,
+                   help="gesture_recognizer.task path override "
+                        "(only used if GestureConfig.ENABLED)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--simulate", action="store_true", default=True,
                    help="no robot hardware (default)")
@@ -320,7 +419,8 @@ def main(argv=None):
         logger.warning("LIVE MODE: the UR3 will move. Confirm the workspace is "
                        "clear and RobotConfig has been set for this rig.")
     run(a.participant, a.condition, a.minutes, a.simulate, a.model,
-        a.log_dir, a.calibration_seconds, a.side_index, a.front_index, preview=a.preview)
+        a.log_dir, a.calibration_seconds, a.side_index, a.front_index,
+        preview=a.preview, gesture_model_path=a.gesture_model)
     return 0
 
 

@@ -431,6 +431,18 @@ class GoalBasedController:
         self._count = 0
         self._episode_fires = 0
 
+    def reset_dwell_timer(self) -> None:
+        """Clear ONLY the sustained-dwell timer, leaving cooldown, episode
+        decay, and the intervention count untouched -- unlike reset(). Used by
+        gesture-driven RESUME (see gesture_control.py): a strain episode that
+        was already sustained above THRESHOLD before a PAUSE must not carry
+        that dwell time across the pause and fire on the very first
+        post-resume frame. Deliberately narrower than reset(): resetting
+        _last_intervention_at here would also bypass COOLDOWN_S, which is not
+        what a pause/resume should do."""
+        self._above_since = None
+        self._above_since_wall = 0.0
+
     def evaluate(self, pss_components: dict, angles: PostureAngles, robot,
                  now: Optional[float] = None) -> dict:
         now = now if now is not None else time.time()

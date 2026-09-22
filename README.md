@@ -121,6 +121,7 @@ src/
   rula.py               automated RULA scoring with documented assumptions
   evaluation.py         the five analyses
   run_session.py        session entry point, both conditions
+  gesture_control.py    hands-free pause/resume (open palm / closed fist); off by default
 tests/
   test_all.py           30 assert-based regression tests
 tools/
@@ -130,6 +131,7 @@ docs/
   CAMERA_PLACEMENT.md   1 vs 2 cameras, where to put them, what each costs
   SINGULARITY.md        why the arm kept hitting singularities and how it is avoided
   RULA_VERIFICATION.md  the open Table A/B verification task
+  GESTURE_CONTROL.md    hands-free pause/resume: false-positive/occlusion risk, blinding, analysis-exclusion TODO
 ```
 
 ---
@@ -212,6 +214,12 @@ cell must come from the Pilot Factory's own assessment.
 - **Do not pool sessions collected under different camera layouts.** A
   single-camera PSS is a reduced score and is not numerically comparable to a
   two-camera PSS. The layout used is recorded in every session's `_meta.txt`.
+- **Gesture pause/resume is off by default (`GestureConfig.ENABLED = False`)
+  and undecided for study use.** Before enabling it for real sessions, read
+  [docs/GESTURE_CONTROL.md](docs/GESTURE_CONTROL.md) — it flags an open
+  decision (which condition(s) should offer it) and a not-yet-implemented
+  analysis exclusion (paused time still counts toward `evaluation.py`'s
+  PSS statistics).
 
 ---
 

@@ -890,6 +890,195 @@ def test_config_constants_single_source():
 
 
 # --------------------------------------------------------------------------
+# Gesture control (pause/resume). PauseStateMachine has no MediaPipe
+# dependency, so all of these run with no camera, no robot, no MediaPipe --
+# same constraint as the rest of this file. A local Cfg class is used in most
+# of these instead of the real GestureConfig so each test's timing is
+# explicit and does not silently drift if GestureConfig's tuned defaults
+# change later.
+# --------------------------------------------------------------------------
+
+@test
+def test_gesture_palm_pauses_only_after_hold_window():
+    from gesture_control import PauseStateMachine
+
+    class Cfg:
+        HOLD_SECONDS = 0.5; MIN_CONFIDENCE = 0.6; COOLDOWN_S = 1.0
+        PAUSE_GESTURE = "Open_Palm"; RESUME_GESTURE = "Closed_Fist"
+
+    sm = PauseStateMachine(Cfg)
+    assert sm.update("Open_Palm", 0.9, now=0.0) == "RUNNING"
+    assert sm.update("Open_Palm", 0.9, now=0.2) == "RUNNING", \
+        "must not pause before HOLD_SECONDS elapses"
+    assert sm.update("Open_Palm", 0.9, now=0.4) == "RUNNING"
+    assert sm.update("Open_Palm", 0.9, now=0.6) == "PAUSED", \
+        "must pause once the gesture has been held past HOLD_SECONDS"
+
+
+@test
+def test_gesture_fist_resumes_only_after_hold_window():
+    from gesture_control import PauseStateMachine
+
+    class Cfg:
+        HOLD_SECONDS = 0.5; MIN_CONFIDENCE = 0.6; COOLDOWN_S = 0.0
+        PAUSE_GESTURE = "Open_Palm"; RESUME_GESTURE = "Closed_Fist"
+
+    sm = PauseStateMachine(Cfg)
+    assert sm.update("Open_Palm", 0.9, now=0.0) == "RUNNING"
+    assert sm.update("Open_Palm", 0.9, now=0.6) == "PAUSED"
+
+    assert sm.update("Closed_Fist", 0.9, now=1.0) == "PAUSED", \
+        "must not resume before HOLD_SECONDS elapses"
+    assert sm.update("Closed_Fist", 0.9, now=1.2) == "PAUSED"
+    assert sm.update("Closed_Fist", 0.9, now=1.6) == "RUNNING", \
+        "must resume once the fist has been held past HOLD_SECONDS"
+
+
+@test
+def test_gesture_cooldown_blocks_immediate_retoggle():
+    from gesture_control import PauseStateMachine
+
+    class Cfg:
+        HOLD_SECONDS = 0.3; MIN_CONFIDENCE = 0.6; COOLDOWN_S = 2.0
+        PAUSE_GESTURE = "Open_Palm"; RESUME_GESTURE = "Closed_Fist"
+
+    sm = PauseStateMachine(Cfg)
+    assert sm.update("Open_Palm", 0.9, now=0.0) == "RUNNING"
+    assert sm.update("Open_Palm", 0.9, now=0.35) == "PAUSED"
+
+    # A fist appears immediately and is held past its OWN hold window, but
+    # the cooldown since the PAUSE transition (now=0.35) has not elapsed.
+    assert sm.update("Closed_Fist", 0.9, now=0.4) == "PAUSED"
+    assert sm.update("Closed_Fist", 0.9, now=1.0) == "PAUSED", \
+        "cooldown must still be blocking the re-toggle"
+    assert sm.update("Closed_Fist", 0.9, now=2.4) == "RUNNING", \
+        "once COOLDOWN_S has elapsed since the PAUSE, resume should go through"
+
+
+@test
+def test_gesture_toggle_while_already_in_target_state_is_idempotent():
+    from gesture_control import PauseStateMachine
+
+    class Cfg:
+        HOLD_SECONDS = 0.2; MIN_CONFIDENCE = 0.6; COOLDOWN_S = 0.1
+        PAUSE_GESTURE = "Open_Palm"; RESUME_GESTURE = "Closed_Fist"
+
+    sm = PauseStateMachine(Cfg)
+    # RESUME (fist) while already RUNNING must be a no-op.
+    assert sm.update("Closed_Fist", 0.9, now=0.0) == "RUNNING"
+    assert sm.update("Closed_Fist", 0.9, now=0.25) == "RUNNING"
+
+    # PAUSE (palm), then PAUSE again while already PAUSED must stay a no-op.
+    assert sm.update("Open_Palm", 0.9, now=1.0) == "RUNNING"
+    assert sm.update("Open_Palm", 0.9, now=1.25) == "PAUSED"
+    assert sm.update("Open_Palm", 0.9, now=1.5) == "PAUSED"
+    assert sm.update("Open_Palm", 0.9, now=2.0) == "PAUSED", \
+        "PAUSE while already paused must stay a no-op"
+
+
+@test
+def test_gesture_single_frame_spurious_palm_does_not_toggle():
+    from gesture_control import PauseStateMachine
+
+    class Cfg:
+        HOLD_SECONDS = 0.5; MIN_CONFIDENCE = 0.6; COOLDOWN_S = 1.0
+        PAUSE_GESTURE = "Open_Palm"; RESUME_GESTURE = "Closed_Fist"
+
+    sm = PauseStateMachine(Cfg)
+    assert sm.update("Open_Palm", 0.9, now=0.0) == "RUNNING", \
+        "a single frame, even at t=0, must never toggle on its own"
+    # gesture disappears immediately (hand moved / momentary shape)
+    assert sm.update(None, 0.0, now=0.05) == "RUNNING"
+    assert sm.update(None, 0.0, now=1.0) == "RUNNING"
+
+
+@test
+def test_gesture_disabled_by_default_and_no_camera_disables_it():
+    """With GestureConfig.ENABLED at its default (False), gesture control
+    must be fully inert: run_session.build_gesture_control() must return the
+    all-None disabled dict, so the task loop path is byte-for-byte unchanged
+    from before this feature existed. Also covers the other early-out: even
+    with ENABLED=True, a camera layout with neither a front nor a side
+    camera must disable the feature for that run (with a warning) rather
+    than raise."""
+    import gesture_control as gc
+    from run_session import build_gesture_control
+
+    assert gc.GestureConfig.ENABLED is False, \
+        "GestureConfig.ENABLED must default to False"
+    g = build_gesture_control(det_side=None, det_front=None)
+    assert g == {"recognizer": None, "state": None, "camera": None}
+
+    gc.GestureConfig.ENABLED = True
+    try:
+        g2 = build_gesture_control(det_side=None, det_front=None)
+        assert g2["recognizer"] is None and g2["camera"] is None, \
+            "no camera available in this layout must disable the feature, not fail"
+    finally:
+        gc.GestureConfig.ENABLED = False   # do not leak state into other tests
+
+
+@test
+def test_resume_resets_controller_dwell_timer_so_no_immediate_intervention():
+    """A dwell timer that was already counting up before a gesture PAUSE must
+    not carry across it. Without GoalBasedController.reset_dwell_timer()
+    being called on RESUME, the very next evaluate() call would see
+    (now - _above_since) already >= SUSTAINED_S from before the pause and
+    fire immediately -- this is exactly what run_session.py's gesture block
+    calls on the PAUSED -> RUNNING transition."""
+    from pss_v2 import PSSv2Calculator, PostureAngles
+    from goal_controller import GoalBasedController, ControllerConfig
+    from robot_interface import SimulatedRobot
+
+    ctrl = GoalBasedController("experimental", PSSv2Calculator())
+    robot = SimulatedRobot()
+    ang = PostureAngles(trunk_flexion_deg=55, neck_flexion_deg=28)
+    comp = {"pss_smooth": 0.6}   # comfortably above THRESHOLD regardless of tuning
+
+    r = ctrl.evaluate(comp, ang, robot, now=0.0)
+    assert r["reason"] == "monitoring", "dwell timer should arm on the first frame"
+    r = ctrl.evaluate(comp, ang, robot, now=ControllerConfig.SUSTAINED_S - 0.1)
+    assert not r["triggered"], "should still be within the dwell window"
+    assert ctrl._above_since is not None, "dwell timer should be armed"
+
+    # Simulate the gesture PAUSE -> RESUME transition.
+    ctrl.reset_dwell_timer()
+
+    # First post-resume frame, well past the ORIGINAL dwell window: must NOT
+    # trigger immediately, because the timer restarts from this call.
+    r = ctrl.evaluate(comp, ang, robot, now=ControllerConfig.SUSTAINED_S + 5.0)
+    assert not r["triggered"], \
+        "stale pre-pause dwell timer fired an intervention on the first post-resume frame"
+    assert r["reason"] == "monitoring", \
+        f"dwell timer was not actually reset: {r['reason']}"
+
+
+@test
+def test_logger_paused_column_defaults_false_and_gesture_config_is_snapshotted():
+    import csv
+    from session_logger_v2 import SessionLoggerV2, FRAME_COLUMNS
+    from pss_v2 import PSSv2Calculator, PostureAngles
+
+    assert "paused" in FRAME_COLUMNS
+
+    tmp = tempfile.mkdtemp()
+    log = SessionLoggerV2("P99", "control", log_dir=tmp, log_frequency_hz=1000)
+    pss = PSSv2Calculator()
+    ang = PostureAngles(trunk_flexion_deg=10, neck_flexion_deg=5)
+    comp = pss.compute(ang)
+    assert log.log_frame(ang, comp)   # `paused` not passed -> must default False
+    log.close()
+
+    with open(log.frames_path) as f:
+        rows = list(csv.DictReader(f))
+    assert rows[0]["paused"] == "0", \
+        f"paused must default to '0' (False) for callers that don't pass it: {rows[0]['paused']}"
+
+    meta = open(log.meta_path).read()
+    assert "gesture.ENABLED" in meta, "GestureConfig not snapshotted into meta"
+
+
+# --------------------------------------------------------------------------
 # Evaluation
 # --------------------------------------------------------------------------
 

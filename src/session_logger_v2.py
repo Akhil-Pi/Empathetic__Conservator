@@ -76,6 +76,11 @@ def capture_config_snapshot() -> dict:
         dump("fusion", FusionConfig)
     except Exception:
         pass
+    try:
+        from gesture_control import GestureConfig
+        dump("gesture", GestureConfig)
+    except Exception:
+        pass
     return snap
 
 
@@ -90,6 +95,7 @@ FRAME_COLUMNS = [
     "group_A", "group_B",
     "pss_raw", "pss_smooth",
     "arm_side", "skew_ms",
+    "paused",
 ]
 
 EVENT_COLUMNS = [
@@ -140,10 +146,18 @@ class SessionLoggerV2:
     # ---- per-frame -------------------------------------------------------
 
     def log_frame(self, angles: Any, components: dict,
-                  arm_side: str = "", skew_ms: Optional[float] = None) -> bool:
+                  arm_side: str = "", skew_ms: Optional[float] = None,
+                  paused: bool = False) -> bool:
         """Throttled per-frame log. `angles` is a PostureAngles, `components`
         the dict returned by PSSv2Calculator.compute(). Returns True if a row was
-        written, False if this call was throttled."""
+        written, False if this call was throttled.
+
+        `paused` defaults to False so existing callers (and the frame
+        self-consistency test) are unaffected; gesture-driven PAUSE passes
+        True so paused frames are marked in the CSV rather than silently
+        counted as ordinary monitored task time. Written as "0"/"1", not
+        "True"/"False", so it round-trips through a plain float() cast like
+        every other numeric column here."""
         now = time.time()
         if (now - self._last_frame_t) < (1.0 / self.log_frequency_hz):
             return False
@@ -185,6 +199,7 @@ class SessionLoggerV2:
             f"{components.get('pss_smooth', 0.0):.4f}",
             arm_side,
             f"{skew_ms:.1f}" if skew_ms is not None else "",
+            "1" if paused else "0",
         ])
         self._frames_logged += 1
         if (now - self._last_flush_t) >= self.flush_every_s:
