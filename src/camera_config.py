@@ -330,7 +330,7 @@ class CameraConfig:
     # Unused roles stay None. On Linux prefer /dev/v4l/by-id/... paths, which
     # survive a replug; integer indices do not.
     SIDE_SOURCE = 1
-    FRONT_SOURCE = 0
+    FRONT_SOURCE = 2
     OBLIQUE_SOURCE = None
 
     # As-built geometry, filled in during rig setup and recorded in the session
