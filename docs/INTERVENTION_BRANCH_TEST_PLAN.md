@@ -21,13 +21,37 @@ interpretable rig-test policy:
   `neck_sidebend_deg`'s magnitude while keeping twist's sign, which is what
   DEBUG17 event 7 did: twist=-5.57°, sidebend=+14.12°, sign and magnitude
   came from two different signals and disagreed).
-- If there is no head-turn signal, trunk or neck flexion above `15 deg`
-  produces a small positive `dz` command.
-- `SEQUENTIAL_ACTIONS = True`: when both a rotate and a raise would fire in
-  the same cycle, only the higher-priority one (`rotate`, by default) executes
-  this cycle; the other waits for its own next trigger. So in practice almost
-  every triggered event is a **pure** rotation or a **pure** raise, not both
-  at once — see the logging note below, it matters for reading the CSV.
+- Trunk or neck flexion above `FORWARD_LEAN_TRIGGER_DEG` produces a small
+  positive `dz` command, independent of the rotate signal.
+  **Lowered from 15 deg to 10 deg (2026-09-14, live tests DEBUG20-22):**
+  `forward_signal` almost never reached 15 deg at the exact instant a cycle
+  fired (closest miss was 14.28 deg), and no more than one continuous 2s
+  dwell above 15 deg occurred across three full live sessions, so raise fired
+  on only 2 of 40 triggered events. 10 deg is the current value; if you
+  change it again, re-run the same instant-vs-threshold check against a
+  fresh `events.csv` rather than assuming it worked.
+- **`SEQUENTIAL_ACTIONS = False` (2026-09-14, live tests DEBUG23/24) — changed
+  from `True`.** With `True`, when both a rotate and a raise condition were
+  met in the same cycle, only the higher-priority one (`rotate`) executed;
+  the other's delta was zeroed OUTRIGHT, not delayed. Live data showed this
+  discarding a genuine, independently-satisfied raise condition often, not
+  rarely: of 23 rotate-only events across DEBUG23/24, 11 (48%) had
+  `forward_signal` already above `FORWARD_LEAN_TRIGGER_DEG` at that same
+  instant (one as high as 35.2 deg of trunk flexion) but got thrown away
+  because a small head-turn/tilt happened at the same time — a natural
+  combined posture, not an edge case. This also violated the original spec:
+  both actions should trigger when both conditions are present. With `False`,
+  whenever both conditions are met in the same cycle, BOTH `delta['drot']`
+  and `delta['dz']` stay non-zero and `_execute()` calls both
+  `robot.adjust_rotation()` and `robot.move_relative()` — rotate still goes
+  first, ordered by `ACTION_PRIORITY`, which keeps its original role
+  (execution order) instead of acting as a veto. Practical effect on the rig:
+  a combined-strain intervention is now usually **two** distinct robot
+  motions back to back (rotate then raise) in one cycle, not one. This is
+  more motion to watch/read per event but is what "both should trigger"
+  actually requires. `SEQUENTIAL_ACTIONS=True` is still supported (not
+  deleted) if a future rig session wants the single-clean-motion behavior
+  back — see `test_sequential_actions_opt_in_still_hands_off_correctly`.
 - Intervention event details include the active policy and signed
   `command_delta`.
 - **Logging (DEBUG18 fix):** rotation and translation used to share one
@@ -41,10 +65,10 @@ interpretable rig-test policy:
   `last_rotation`).
 - **Stale-field fix:** whichever half did NOT run in a cycle is explicitly
   zeroed (`applied=[0,0,0,0]`, `ok=True`), never left holding a leftover
-  value from a previous, unrelated event (DEBUG17 event 9, and — since
-  `SEQUENTIAL_ACTIONS=True` makes single-action cycles the *common* case, not
-  a corner case — this also covers every ordinary pure-rotation or pure-raise
-  event, not just the "nothing happened at all" case).
+  value from a previous, unrelated event (DEBUG17 event 9). This still
+  matters with `SEQUENTIAL_ACTIONS=False`: a rotate-only or raise-only event
+  (only one condition met this cycle) is still common, it's just no longer
+  the *only* outcome when both conditions are met — see below.
 - **`--simulate` dry runs now exercise this too:** `SimulatedRobot` did not
   override `adjust_rotation()` before, so it silently fell through to the
   base class's Cartesian version, which writes `last_move`, not
@@ -62,8 +86,8 @@ Regression tests for all of the above live in `tests/test_all.py`:
 `test_head_turn_signal_falls_back_to_sidebend_below_noise_floor`,
 `test_execute_does_not_leave_stale_data_in_untouched_half`,
 `test_simulated_robot_rotation_updates_last_rotation`,
-`test_priority_hands_off_to_raise_once_rotate_condition_clears`,
-`test_priority_never_hands_off_if_rotate_condition_truly_never_clears`. Run
+`test_both_actions_fire_together_when_both_conditions_met`,
+`test_sequential_actions_opt_in_still_hands_off_correctly`. Run
 `python3 tests/test_all.py` and confirm these six pass (they do not need
 cv2, pandas, or a robot) before touching the rig.
 
@@ -92,47 +116,32 @@ rotation; `dz` non-zero and `drot` zero is a pure raise.
 - **Pure raise events:** the mirror image — `applied` non-zero, `rot_applied`
   now correctly reads `[0,0,0,0]` (previously this was one of the fields left
   stale; now it should never be).
-- **Combined events (both fired the same cycle — only possible if
-  `SEQUENTIAL_ACTIONS` gets set to `False`, or in a future non-sequential
-  policy):** check `rot_ok`/`rot_applied` and `ok`/`applied` independently. A
-  refusal on one side (e.g. `singularity=radius`) must not by itself say
-  anything about whether the other side succeeded — that's the whole point of
-  the split. Confirm the two can disagree (one `ok=True`, the other
-  `ok=False`) in at least one logged event before trusting the split.
+- **Combined events (both `drot` and `dz` non-zero in `command={...}`) are
+  now the EXPECTED outcome whenever a person's posture genuinely has both a
+  head-turn/tilt AND a forward-lean above their triggers at once** — this is
+  the normal case now, not a rare one, since `SEQUENTIAL_ACTIONS=False`.
+  Check `rot_ok`/`rot_applied` and `ok`/`applied` independently. A refusal on
+  one side (e.g. `singularity=radius`) must not by itself say anything about
+  whether the other side succeeded — that's the whole point of the split.
+  Confirm the two can disagree (one `ok=True`, the other `ok=False`) in at
+  least one logged event before trusting the split. Also confirm the physical
+  order on the rig matches the log: rotate should visibly start first, raise
+  right after (same cycle, not the next trigger) — per `ACTION_PRIORITY`.
 - **Head-tilt-only trials (twist < 8°, sidebend ≥ 8°):** confirm `drot` fires
   with sidebend's sign, and that a *small* twist (2-8°, opposite-signed to
   sidebend) correctly suppresses the trigger rather than firing with a mixed
   sign — this was event 7 live.
 - If the signed `drot` is correct but the fixture rotates the wrong physical
   way, flip `ControllerConfig.LATERAL_SIGN` or fix the robot-frame mapping.
-- **Watch how the combined trial hands off between rotate and raise.**
-  `ACTION_PRIORITY` is intended to work like this: rotate (the higher
-  priority) keeps taking every retrigger for as long as ITS OWN condition
-  (twist/tilt ≥ 8°) is still true on the freshly-read camera angles, then
-  hands off to raise the instant that condition clears — "run the priority
-  action until it's satisfied, then move to the other." Simulated in
-  `test_priority_hands_off_to_raise_once_rotate_condition_clears`
-  (`tests/test_all.py`): with a decaying twist signal and a constant lean
-  signal, rotate fires every cycle while twist ≥ 8°, and raise takes over on
-  the very next cycle once twist drops below 8° — the mechanism works as
-  designed.
-  **The catch, for the rig:** the hand-off only happens if the measured
-  twist/tilt signal actually drops below 8° at some point. There is no
-  fallback that hands control to raise just because time has passed or a
-  retrigger count was reached — `ACTION_PRIORITY` re-reads the raw signal
-  fresh every cycle. `test_priority_never_hands_off_if_rotate_condition_truly_never_clears`
-  pins the extreme case (a signal that never moves at all: 15 retriggers,
-  rotate every time, raise never) so this doesn't get silently
-  "fixed" or re-discovered from scratch later. So during the combined trial
-  (step 3 above): if you hold a combined posture and see `drot` fire on
-  every retrigger while `dz` never does, first check whether your OWN
-  twist/tilt is actually staying above 8° the whole time (deliberately keep
-  it fixed to test the worst case) or whether it's naturally easing off
-  (normal test conditions) — the 3-second hold in step 3 is too short to
-  see more than one trigger anyway, so for this specific check hold the
-  combined posture for 20-30s and watch whether `dz` ever appears. If it
-  never does even though your twist genuinely eased off partway through,
-  that's a real bug, not the known edge case above.
+- **If you see a rotate-only event where the logged `angles.trunk_flexion_deg`
+  or `neck_flexion_deg` is already above `FORWARD_LEAN_TRIGGER_DEG` (10°),
+  that's a regression** — with `SEQUENTIAL_ACTIONS=False` this should no
+  longer happen; `dz` should have fired alongside `drot` in that same event.
+  This exact pattern (rotate wins, `dz`'s own condition was independently
+  met and got thrown away) is what DEBUG23/24 showed under the old
+  `SEQUENTIAL_ACTIONS=True` default 48% of the time — it's the thing this
+  change was made to fix, so specifically check for it in the new
+  `events.csv`.
 - **Singularity refusals late in a session** (`singularity=radius` after
   several raises): expected if `dz` has accumulated toward the envelope edge
   — this is the safety clamp doing its job, not a fault. Don't spend time

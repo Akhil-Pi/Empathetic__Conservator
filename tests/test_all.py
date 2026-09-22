@@ -434,26 +434,73 @@ def test_clamping_is_reported():
 
 
 @test
-def test_priority_hands_off_to_raise_once_rotate_condition_clears():
-    """Confirms the INTENDED design: with SEQUENTIAL_ACTIONS=True and
-    ACTION_PRIORITY={rotate:2, raise:1}, rotate is meant to keep taking every
-    retrigger for as long as its own condition (neck twist/tilt >= 8 deg)
-    stays true, then hand off to raise the moment that condition clears --
-    "execute priority repeatedly until it's satisfied, then move to the
-    other." Here neck_twist_deg decays from 18 deg toward 0 across retriggers
-    (standing in for the person's own twist easing off, e.g. because the
-    rotation correction already helped, or they naturally shift), while the
-    forward-lean condition stays on throughout. Confirms: every trigger while
-    twist >= 8 deg fires ONLY drot; the first trigger once twist < 8 deg, and
-    every one after, fires ONLY dz -- the handoff happens on the very next
-    retrigger, not stuck on rotate."""
+def test_both_actions_fire_together_when_both_conditions_met():
+    """Confirms the CURRENT default (SEQUENTIAL_ACTIONS=False, set 2026-09-14
+    after live tests DEBUG23/24). With SEQUENTIAL_ACTIONS=True, a real,
+    independently-satisfied raise condition was being discarded outright
+    whenever rotate also fired in the same cycle, not just delayed: live data
+    showed this happening on 11 of 23 (48%) rotate-only events -- a natural
+    combined lean+head-turn, not a rare edge case -- which violates the
+    original spec (both should trigger when both are present). With
+    SEQUENTIAL_ACTIONS=False, when both a twist/tilt AND a forward-lean
+    condition are met in the same cycle, BOTH delta['drot'] and delta['dz']
+    must be non-zero, and _execute() must call both robot.adjust_rotation()
+    and robot.move_relative() (rotate first, per ACTION_PRIORITY) -- not one
+    zeroing out the other."""
     from pss_v2 import PostureAngles, PSSv2Calculator
     from goal_controller import GoalBasedController, ControllerConfig
     from robot_interface import SimulatedRobot
 
+    assert ControllerConfig.SEQUENTIAL_ACTIONS is False, \
+        "this test documents the current default; update it if the default changes back"
+
     pss = PSSv2Calculator()
     pss.calibrate_neutral([PostureAngles() for _ in range(30)])
     ctrl = GoalBasedController("experimental", pss_calc=pss)
+    robot = SimulatedRobot()
+    # both conditions clearly above trigger: neck_twist_deg=20 (>=8), forward
+    # lean 45/22 (>=10)
+    ang = PostureAngles(trunk_flexion_deg=45.0, neck_flexion_deg=22.0, neck_twist_deg=20.0)
+
+    t = 0.0
+    for _ in range(8):
+        r = ctrl.evaluate(pss.compute(ang, now=t), ang, robot, now=t)
+        t += 0.5
+        if r.get("triggered"):
+            d = r["delta"]
+            assert abs(d.get("drot", 0.0)) > 1e-9, "rotate should have fired"
+            assert abs(d.get("dz", 0.0)) > 1e-9, "raise should ALSO have fired, not been zeroed"
+            assert robot.last_rotation["ok"] is True and robot.last_rotation["applied"], \
+                "adjust_rotation was not actually called"
+            assert robot.last_move["ok"] is True and any(
+                abs(v) > 1e-9 for v in robot.last_move["applied"]), \
+                "move_relative was not actually called"
+            return
+    raise AssertionError("no intervention fired")
+
+
+@test
+def test_sequential_actions_opt_in_still_hands_off_correctly():
+    """SEQUENTIAL_ACTIONS=True is no longer the default (see
+    test_both_actions_fire_together_when_both_conditions_met) but is still a
+    supported opt-in mode -- keep its hand-off mechanism covered in case a
+    future rig-tuning session re-enables it. Confirms the INTENDED design of
+    that mode: with ACTION_PRIORITY={rotate:2, raise:1}, rotate keeps taking
+    every retrigger for as long as its own condition (neck twist/tilt >= 8
+    deg) stays true, then hands off to raise the moment that condition
+    clears. neck_twist_deg decays from 18 deg toward 0 across retriggers
+    (standing in for the person's own twist easing off), while the
+    forward-lean condition stays on throughout."""
+    from pss_v2 import PostureAngles, PSSv2Calculator
+    from goal_controller import GoalBasedController, ControllerConfig
+    from robot_interface import SimulatedRobot
+
+    class SequentialCfg(ControllerConfig):
+        SEQUENTIAL_ACTIONS = True
+
+    pss = PSSv2Calculator()
+    pss.calibrate_neutral([PostureAngles() for _ in range(30)])
+    ctrl = GoalBasedController("experimental", pss_calc=pss, cfg=SequentialCfg)
     robot = SimulatedRobot()
 
     t = 0.0
@@ -469,72 +516,18 @@ def test_priority_hands_off_to_raise_once_rotate_condition_clears():
                 fired.append((twist, abs(d.get("drot", 0.0)) > 1e-9,
                              abs(d.get("dz", 0.0)) > 1e-9))
             t += 0.2
-        t += ControllerConfig.COOLDOWN_S + 0.1
+        t += SequentialCfg.COOLDOWN_S + 0.1
 
     assert len(fired) >= 4, "expected setup: several retriggers over the decay"
     for twist, rotated, raised in fired:
-        if twist >= ControllerConfig.HEAD_TURN_TRIGGER_DEG:
+        if twist >= SequentialCfg.HEAD_TURN_TRIGGER_DEG:
             assert rotated and not raised, \
                 f"twist={twist} still above trigger; rotate should still own this cycle"
         else:
             assert raised and not rotated, \
                 f"twist={twist} cleared the trigger; raise should have taken over"
-    # and the handoff must actually have been exercised both ways
     assert any(r for _, r, _ in fired) and any(d for _, _, d in fired), \
         "test setup did not exercise both rotate and raise -- widen the decay range"
-
-
-@test
-def test_priority_never_hands_off_if_rotate_condition_truly_never_clears():
-    """KNOWN, NARROW EDGE CASE -- not the same claim as before.
-
-    An earlier version of this test used a completely STATIC posture (twist
-    fixed at 12 deg for the whole run) and read the result as rotate
-    'starving' raise indefinitely. That was too strong a claim: it wasn't
-    testing the hand-off mechanism (see
-    test_priority_hands_off_to_raise_once_rotate_condition_clears, which
-    passes -- hand-off works correctly once the twist SIGNAL actually drops
-    below HEAD_TURN_TRIGGER_DEG), it was testing what happens when the
-    signal never varies at all, which is a much narrower situation.
-
-    This still matters for the live rig: ACTION_PRIORITY re-evaluates raw
-    twist/lean off the FRESH camera reading every cycle, with no fallback
-    that hands control to raise just because time has passed. So the only
-    real remaining risk is a person whose measured twist genuinely never
-    drops below 8 deg for the whole episode (a task that structurally
-    requires sustained twisting, not just an artifact of a synthetic test).
-    Whether that's realistic is a live-rig question, not something this
-    suite can answer -- see the note in INTERVENTION_BRANCH_TEST_PLAN.md
-    about holding a combined posture long enough to actually see (or rule
-    out) a handoff during tomorrow's session."""
-    from pss_v2 import PostureAngles, PSSv2Calculator
-    from goal_controller import GoalBasedController, ControllerConfig
-    from robot_interface import SimulatedRobot
-
-    pss = PSSv2Calculator()
-    pss.calibrate_neutral([PostureAngles() for _ in range(30)])
-    ctrl = GoalBasedController("experimental", pss_calc=pss)
-    robot = SimulatedRobot()
-    ang = PostureAngles(trunk_flexion_deg=45.0, neck_flexion_deg=22.0, neck_twist_deg=12.0)
-
-    t = 0.0
-    rotate_fired = raise_fired = 0
-    for _cycle in range(15):
-        for _ in range(12):
-            comp = pss.compute(ang, now=t)
-            r = ctrl.evaluate(comp, ang, robot, now=t)
-            if r.get("triggered"):
-                d = r["delta"]
-                rotate_fired += abs(d.get("drot", 0.0)) > 1e-9
-                raise_fired += abs(d.get("dz", 0.0)) > 1e-9
-            t += 0.2
-        t += ControllerConfig.COOLDOWN_S + 0.1
-
-    assert rotate_fired > 0, "expected setup: rotate should dominate"
-    assert raise_fired == 0, (
-        "raise fired at least once with a perfectly static twist signal -- if "
-        "this assertion now fails, behaviour has changed; update this test to "
-        "match rather than deleting it")
 
 
 @test
