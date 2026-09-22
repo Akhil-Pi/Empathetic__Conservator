@@ -122,16 +122,22 @@ src/
   evaluation.py         the five analyses
   run_session.py        session entry point, both conditions
   gesture_control.py    hands-free pause/resume (open palm / closed fist); off by default
+  feasibility_report.py pre-procurement decision report (addressable vs irreducible strain, go/no-go)
+  task_profile.py        TaskProfile: conservation (default) + manufacturing_assembly example
+  intervention_explainer.py   per-intervention plain-language explanation, from existing events.csv
 tests/
   test_all.py           30 assert-based regression tests
 tools/
   make_synthetic_sessions.py   logger-shaped synthetic data for pipeline testing
+  make_synthetic_sessions_manufacturing.py   sibling generator for the manufacturing_assembly profile
 docs/
   RIG_SETUP.md          hardware-day checklist and calibration procedure
   CAMERA_PLACEMENT.md   1 vs 2 cameras, where to put them, what each costs
   SINGULARITY.md        why the arm kept hitting singularities and how it is avoided
   RULA_VERIFICATION.md  the open Table A/B verification task
   GESTURE_CONTROL.md    hands-free pause/resume: false-positive/occlusion risk, blinding, analysis-exclusion TODO
+  DECISION_REPORT.md    the feasibility report's claims, cutoff justification, and always-printed caveats
+  GENERALISATION.md     the TaskProfile model and how to add a task
 ```
 
 ---
@@ -220,6 +226,16 @@ cell must come from the Pilot Factory's own assessment.
   decision (which condition(s) should offer it) and a not-yet-implemented
   analysis exclusion (paused time still counts toward `evaluation.py`'s
   PSS statistics).
+- **The feasibility report refuses to mix real and synthetic sessions**,
+  and labels every number it emits with data origin and N. See
+  [docs/DECISION_REPORT.md](docs/DECISION_REPORT.md) for the decision
+  cutoff and its justification, and treat rig-test/pilot session files
+  (`DEBUG*`, `TEST*`, `HEAD*`) as real-but-informal data, not a validated
+  study cohort, even though the report correctly labels them "real".
+- **A `TaskProfile` (see [docs/GENERALISATION.md](docs/GENERALISATION.md))
+  is descriptive until explicitly applied.** `conservation` is the default
+  and reproduces today's `ControllerConfig`/`RobotConfig` defaults exactly;
+  nothing in the existing pipeline selects a profile automatically.
 
 ---
 
