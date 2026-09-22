@@ -29,6 +29,11 @@ _SRC = os.path.abspath(_SRC)
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+_TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
+_TOOLS = os.path.abspath(_TOOLS)
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
+
 RESULTS = []
 
 
@@ -1247,6 +1252,322 @@ def test_h1_reports_shapiro_and_both_tests():
     assert "shapiro" in r and "wilcoxon" in r and "paired_t" in r
     assert "secondary_frac_above" in r
     assert r["n_pairs"] == 6
+
+
+# --------------------------------------------------------------------------
+# Feasibility report (Part A), task generalisation (Part B), and
+# per-intervention explainability (Part C). No camera, no robot. Several of
+# these write a small self-contained session cohort to a tempdir (real-style
+# via session_logger_v2.SessionLoggerV2, synthetic-style via
+# make_synthetic_sessions.write_session) rather than depending on test_data/
+# or data/synthetic/ existing on disk, so this suite stays runnable from a
+# clean checkout.
+# --------------------------------------------------------------------------
+
+@test
+def test_feasibility_decision_rule_at_cutoffs():
+    """Exercises decide_verdict just below, at, and just above each named
+    cutoff. GO_THRESHOLD is inclusive; NOGO_THRESHOLD's upper bound is
+    exclusive -- the two partition [0, 1] with no gap."""
+    from feasibility_report import decide_verdict, FeasibilityConfig as C
+
+    assert decide_verdict(C.NOGO_THRESHOLD - 0.001) == "NO-GO"
+    assert decide_verdict(C.NOGO_THRESHOLD) == "INCONCLUSIVE_AT_THIS_N"
+    assert decide_verdict(C.GO_THRESHOLD - 0.001) == "INCONCLUSIVE_AT_THIS_N"
+    assert decide_verdict(C.GO_THRESHOLD) == "GO"
+    assert decide_verdict(0.0) == "NO-GO"
+    assert decide_verdict(1.0) == "GO"
+
+
+@test
+def test_feasibility_refuses_mixed_origin():
+    from feasibility_report import cohort_origin, session_origin, MixedOriginError
+    from evaluation import Session
+    import pandas as pd
+
+    real = Session("R1", "experimental", pd.DataFrame(), pd.DataFrame(), {})
+    synth = Session("S1", "experimental", pd.DataFrame(), pd.DataFrame(),
+                    {"note": "SYNTHETIC data for pipeline validation only"})
+
+    assert session_origin(real.meta) == "real"
+    assert session_origin(synth.meta) == "synthetic"
+    assert cohort_origin([real, real]) == "real"
+    assert cohort_origin([synth, synth]) == "synthetic"
+    try:
+        cohort_origin([real, synth])
+        raise AssertionError("mixed-origin cohort was not refused")
+    except MixedOriginError:
+        pass
+
+
+@test
+def test_feasibility_addressable_and_irreducible_consistent_on_known_synthetic_cohort():
+    """A small synthetic cohort with the SAME designed trunk-dominated vs
+    arm-dominated decomposition make_synthetic_sessions.py documents.
+    addressable_fraction + irreducible_fraction must sum to 1 and both must
+    lie in [0, 1]; the verdict must be one of the three allowed strings."""
+    from make_synthetic_sessions import simulate_session, write_session
+    from feasibility_report import compute_feasibility
+
+    tmp = tempfile.mkdtemp()
+    # P1/P2 are TRUNK_DOMINATED, P4/P5 are ARM_DOMINATED in
+    # make_synthetic_sessions.py's own module-level split.
+    for p, seed in (("P1", 901), ("P2", 902), ("P4", 903), ("P5", 904)):
+        for cond in ("control", "experimental"):
+            seed += 1
+            frames, events = simulate_session(p, cond, seed)
+            write_session(tmp, p, cond, frames, events, seed)
+
+    result = compute_feasibility(tmp, task_name="known synthetic cohort")
+    assert "error" not in result, f"unexpected error: {result.get('error')}"
+    assert result["origin"] == "synthetic"
+
+    total = result["addressable_fraction"] + result["irreducible_fraction"]
+    assert abs(total - 1.0) < 1e-9, f"fractions do not sum to 1: {total}"
+    assert 0.0 <= result["addressable_fraction"] <= 1.0
+    assert 0.0 <= result["irreducible_fraction"] <= 1.0
+    assert result["verdict"] in ("GO", "NO-GO", "INCONCLUSIVE_AT_THIS_N")
+    assert result["n_highstrain_frames"] > 0
+    # designed cohort: SOME strain must be arm-dominated (irreducible > 0)
+    # since ARM_DOMINATED participants are present by construction.
+    assert result["irreducible_fraction"] > 0.0
+
+
+@test
+def test_conservation_profile_reproduces_existing_behaviour():
+    """Applying TaskProfile.CONSERVATION must change nothing numerically:
+    same DOF list, same envelope, and the same optimizer output on a real
+    posture drawn from an actual logged session."""
+    import csv
+    from task_profile import CONSERVATION, apply_profile_dof, apply_profile_envelope
+    from goal_controller import ControllerConfig, optimize_target
+    from robot_interface import RobotConfig
+    from pss_v2 import PSSv2Calculator
+    from evaluation import _row_to_angles
+
+    profiled_ctrl = apply_profile_dof(CONSERVATION)
+    assert list(profiled_ctrl.DOF) == list(ControllerConfig.DOF)
+
+    profiled_robot = apply_profile_envelope(CONSERVATION)
+    assert tuple(profiled_robot.ENVELOPE_MIN) == tuple(RobotConfig.ENVELOPE_MIN)
+    assert tuple(profiled_robot.ENVELOPE_MAX) == tuple(RobotConfig.ENVELOPE_MAX)
+
+    # Numeric regression guard on an existing session file, not a synthetic
+    # posture: pull one real high-strain frame from test_data if present,
+    # else fall back to a synthetic-but-fixed posture so this test still
+    # runs on a clean checkout with no test_data/ directory.
+    test_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "test_data")
+    frame_files = []
+    if os.path.isdir(test_data_dir):
+        frame_files = [f for f in os.listdir(test_data_dir) if f.endswith("_frames.csv")]
+
+    if frame_files:
+        with open(os.path.join(test_data_dir, sorted(frame_files)[0])) as f:
+            rows = list(csv.DictReader(f))
+        best = max(rows, key=lambda r: float(r.get("pss_raw", 0) or 0))
+        ang = _row_to_angles(best)
+    else:
+        from pss_v2 import PostureAngles
+        ang = PostureAngles(trunk_flexion_deg=50, neck_flexion_deg=25,
+                            upper_arm_flexion_deg=30, lower_arm_flexion_deg=85)
+
+    pss = PSSv2Calculator()
+    delta_base, _, _ = optimize_target(ang, pss, ControllerConfig)
+    pss2 = PSSv2Calculator()
+    delta_profiled, _, _ = optimize_target(ang, pss2, profiled_ctrl)
+    for d in ControllerConfig.DOF:
+        assert abs(delta_base[d] - delta_profiled[d]) < 1e-12, \
+            f"conservation profile changed the optimizer's {d} output"
+
+
+@test
+def test_manufacturing_profile_selects_different_dof_and_envelope():
+    from task_profile import (CONSERVATION, MANUFACTURING_ASSEMBLY,
+                              apply_profile_dof, apply_profile_envelope)
+
+    cons_ctrl = apply_profile_dof(CONSERVATION)
+    mfg_ctrl = apply_profile_dof(MANUFACTURING_ASSEMBLY)
+    assert set(mfg_ctrl.DOF) != set(cons_ctrl.DOF)
+    assert "dtilt" not in mfg_ctrl.DOF and "drot" not in mfg_ctrl.DOF
+    assert set(mfg_ctrl.DOF) == {"dz", "dy", "dx"}
+
+    cons_robot = apply_profile_envelope(CONSERVATION)
+    mfg_robot = apply_profile_envelope(MANUFACTURING_ASSEMBLY)
+    assert tuple(mfg_robot.ENVELOPE_MIN) != tuple(cons_robot.ENVELOPE_MIN)
+    assert tuple(mfg_robot.ENVELOPE_MAX) != tuple(cons_robot.ENVELOPE_MAX)
+
+    # optimize_target must never move an excluded DOF for this profile.
+    from goal_controller import optimize_target
+    from pss_v2 import PSSv2Calculator, PostureAngles
+    ang = PostureAngles(trunk_flexion_deg=45, neck_flexion_deg=20,
+                        upper_arm_flexion_deg=80, lower_arm_flexion_deg=60)
+    delta, _, _ = optimize_target(ang, PSSv2Calculator(), mfg_ctrl)
+    # optimize_target keys its result by cfg.DOF only, so an excluded DOF is
+    # not merely zero -- it is never a key at all. That is the stronger and
+    # more correct guarantee: the profile removes the DOF from the search
+    # entirely, not just from what ends up nonzero.
+    assert "dtilt" not in delta and "drot" not in delta
+    assert set(delta.keys()) == {"dz", "dy", "dx"}
+
+
+@test
+def test_explanation_renderer_crafted_events():
+    """A clamped case and a singularity-refusal case, matching the exact
+    details= format run_session.py's log_event(...) produces."""
+    from intervention_explainer import explain_intervention
+
+    clean = {
+        "pss_at_event": "0.534", "predicted_pss_before": "0.534",
+        "predicted_pss_after": "0.412", "moved": "True",
+        "dz": "0.0", "dy": "0.0", "dtilt": "0.0", "drot": "0.15", "dx": "0.0",
+        "details": ("clamped=False applied=[0.0, 0.0, 0.0, 0.0] ok=True "
+                    "singularity=None rot_applied=[0.0, 0.0, 0.0, 0.15] "
+                    "rot_ok=True rot_clamped=False rot_singularity=None "
+                    "policy=head_gaze_rotation command={'dx': -0.0, 'dy': 0.0, "
+                    "'dz': 0.0, 'dtilt': 0.0, 'drot': 0.15} "
+                    "angles={'trunk_flexion_deg': 5.0, 'neck_flexion_deg': 6.0, "
+                    "'neck_twist_deg': 22.0}"),
+    }
+    ex = explain_intervention(clean)
+    assert ex["clamped"] is False and ex["refused"] is False
+    assert ex["dof_moved"] == {"drot": 0.15}
+    assert ex["predicted_pss_before"] == 0.534 and ex["predicted_pss_after"] == 0.412
+    assert "neck" in ex["targeted_strain"]
+    assert "upper_arm" in ex["untouched_strain"] and "lower_arm" in ex["untouched_strain"]
+    assert ex["policy"] == "head_gaze_rotation"
+
+    clamped_case = {
+        "pss_at_event": "0.6", "predicted_pss_before": "0.6",
+        "predicted_pss_after": "0.5", "moved": "True",
+        "dz": "0.02", "dy": "0.0", "dtilt": "0.0", "drot": "0.0", "dx": "0.0",
+        "details": ("clamped=True applied=[0.0, 0.0, 0.02, 0.0] ok=True "
+                    "singularity=None rot_applied=[0.0, 0.0, 0.0, 0.0] "
+                    "rot_ok=True rot_clamped=False rot_singularity=None "
+                    "policy=head_gaze_rotation command={'dz': 0.02} angles={}"),
+    }
+    ex_c = explain_intervention(clamped_case)
+    assert ex_c["clamped"] is True
+    assert ex_c["refused"] is False
+
+    singularity_case = {
+        "pss_at_event": "0.7", "predicted_pss_before": "0.7",
+        "predicted_pss_after": "0.7", "moved": "False",
+        "dz": "0.0", "dy": "0.06", "dtilt": "0.0", "drot": "0.0", "dx": "0.0",
+        "details": ("clamped=True applied=[0.0, 0.0, 0.0, 0.0] ok=False "
+                    "singularity=shoulder rot_applied=[0.0, 0.0, 0.0, 0.0] "
+                    "rot_ok=True rot_clamped=False rot_singularity=None "
+                    "policy=head_gaze_rotation command={'dy': 0.06} "
+                    "angles={'trunk_flexion_deg': 50.0}"),
+    }
+    ex_s = explain_intervention(singularity_case)
+    assert ex_s["refused"] is True
+    assert ex_s["refusal_reason"] is not None and "shoulder" in ex_s["refusal_reason"]
+    assert "trunk" in ex_s["targeted_strain"]
+
+    # A synthetic session's empty details must degrade honestly, not crash
+    # or fabricate clamped/singularity status.
+    synthetic_case = {
+        "pss_at_event": "0.5", "predicted_pss_before": "0.5",
+        "predicted_pss_after": "0.4", "moved": "True",
+        "dz": "0.06", "dy": "0.03", "dtilt": "0.15", "drot": "0.0", "dx": "-0.03",
+        "details": "",
+    }
+    ex_syn = explain_intervention(synthetic_case)
+    assert ex_syn["_details_parsed"] is False
+    assert ex_syn["clamped"] is False and ex_syn["refused"] is False
+    assert ex_syn["policy"] is None
+
+
+@test
+def test_explanation_renderer_reads_existing_events_csv():
+    """render_session_explanations must work on an events.csv already on
+    disk, with no re-run -- exactly the Part C requirement."""
+    from session_logger_v2 import SessionLoggerV2
+    from pss_v2 import PSSv2Calculator, PostureAngles
+    from goal_controller import GoalBasedController
+    from robot_interface import SimulatedRobot
+    from intervention_explainer import render_session_explanations
+
+    tmp = tempfile.mkdtemp()
+    pss = PSSv2Calculator()
+    ctrl = GoalBasedController("experimental", pss)
+    robot = SimulatedRobot()
+    log = SessionLoggerV2("P_EXPLAIN", "experimental", log_dir=tmp, log_frequency_hz=1000)
+    ang = PostureAngles(trunk_flexion_deg=55, neck_flexion_deg=28,
+                        upper_arm_flexion_deg=30, lower_arm_flexion_deg=85)
+    t = 0.0
+    fired = 0
+    for _ in range(20):
+        comp = pss.compute(ang, now=t)
+        r = ctrl.evaluate(comp, ang, robot, now=t)
+        if r.get("triggered"):
+            lm = robot.last_move; lr = robot.last_rotation
+            log.log_event("intervention", comp["pss_smooth"], result=r,
+                          details=f"clamped={lm.get('clamped')} applied={lm.get('applied')} "
+                                  f"ok={lm.get('ok')} singularity={lm.get('singularity')} "
+                                  f"rot_applied={lr.get('applied')} rot_ok={lr.get('ok')} "
+                                  f"rot_clamped={lr.get('clamped')} rot_singularity={lr.get('singularity')} "
+                                  f"policy={r.get('policy')} command={r.get('command_delta')} "
+                                  f"angles={r.get('diagnostic_angles')}")
+            fired += 1
+        t += 0.5
+    log.close()
+    assert fired > 0, "test setup did not produce any interventions to explain"
+
+    text = render_session_explanations(log.events_path)
+    assert f"interventions explained: {fired}" in text
+    assert "Predicted PSS" in text
+
+
+@test
+def test_feasibility_origin_labelling_real_vs_synthetic():
+    """A real-style cohort (session_logger_v2, no synthetic marker) must be
+    labelled 'real' with the correct N; a synthetic one must be labelled
+    'synthetic'."""
+    from session_logger_v2 import SessionLoggerV2
+    from pss_v2 import PSSv2Calculator, PostureAngles
+    from goal_controller import GoalBasedController
+    from robot_interface import SimulatedRobot
+    from feasibility_report import compute_feasibility
+    from make_synthetic_sessions import simulate_session, write_session
+
+    real_dir = tempfile.mkdtemp()
+    # Participant IDs must not contain "_": the filename convention is
+    # "{participant}_{condition}_{timestamp}_*.csv", and an underscore in
+    # the participant segment breaks both evaluation.load_sessions' regex
+    # and feasibility_report.load_sessions_lenient's.
+    for pid in ("REALA", "REALB"):
+        pss = PSSv2Calculator()
+        ctrl = GoalBasedController("experimental", pss)
+        robot = SimulatedRobot()
+        # log_frame()'s throttle uses REAL wall-clock time, not the
+        # simulated `t` below -- a very high rate keeps a fast, tight test
+        # loop from outrunning it and silently dropping frames.
+        log = SessionLoggerV2(pid, "experimental", log_dir=real_dir, log_frequency_hz=1_000_000)
+        ang = PostureAngles(trunk_flexion_deg=45, neck_flexion_deg=22,
+                            upper_arm_flexion_deg=30, lower_arm_flexion_deg=85)
+        t = 0.0
+        for _ in range(100):
+            comp = pss.compute(ang, now=t)
+            log.log_frame(ang, comp)
+            r = ctrl.evaluate(comp, ang, robot, now=t)
+            if r.get("triggered"):
+                log.log_event("intervention", comp["pss_smooth"], result=r)
+            t += 0.5
+        log.close()
+
+    real_result = compute_feasibility(real_dir, task_name="real labelling test")
+    assert "error" not in real_result, f"unexpected error: {real_result.get('error')}"
+    assert real_result["origin"] == "real"
+    assert real_result["n_participants"] == 2
+
+    synth_dir = tempfile.mkdtemp()
+    for p, seed in (("P1", 801), ("P4", 802)):
+        frames, events = simulate_session(p, "experimental", seed)
+        write_session(synth_dir, p, "experimental", frames, events, seed)
+    synth_result = compute_feasibility(synth_dir, task_name="synthetic labelling test")
+    assert synth_result["origin"] == "synthetic"
+    assert synth_result["n_participants"] == 2
 
 
 # --------------------------------------------------------------------------
